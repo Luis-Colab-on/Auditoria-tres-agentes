@@ -5,14 +5,14 @@ from .security import PolicyError, object_hash, now
 from .tools import SourceTools, ToolContext
 from .turn_planning import initial_read_plan
 
-VERSION = 'initial-batch-distribution-1'
+VERSION = 'initial-batch-distribution-2'
 RECORD = 'operational/initial-batch-distribution'
 # Capacity reserves, not a requirement to invent findings or execute every test.
 RESERVES = {'source_followup': 2, 'additional_evidence': 2, 'test_submission': 2}
 
 
 def _original(manifest, config):
-    from .workflow import batches
+    from .turn_planning import batches
     return batches(manifest, config.limits.batch_lines)
 
 
@@ -85,7 +85,8 @@ def build_distribution(store, manifest, config, reviewer):
         raise PolicyError('investigação inicial já congelada; redistribuição recusada')
     original = _original(manifest, config)
     baseline_ids = store.get(manifest.run_id, 'baseline')['ids'] if store.exists(manifest.run_id, 'baseline') else []
-    reserve = sum(RESERVES.values()) + len(baseline_ids)
+    baseline_reserve = max(1, len(baseline_ids))
+    reserve = sum(RESERVES.values()) + baseline_reserve
     capacity = config.limits.max_turns - reserve
     if capacity < 1:
         raise PolicyError('teto não comporta leitura e reservas explícitas')
@@ -116,7 +117,7 @@ def build_distribution(store, manifest, config, reviewer):
     record = {'version': VERSION, **_bindings(manifest, config), 'reviewer': reviewer, 'created_at': now(),
               'original_batches': original, 'original_hash': object_hash(original),
               'batches': replacement, 'parents': parents, 'mapping': mapping, 'costs': costs,
-              'reserves': RESERVES, 'baseline_ids': baseline_ids,
+              'reserves': RESERVES, 'baseline_ids': baseline_ids, 'baseline_reserve': baseline_reserve,
               'inspection_delivery': 'Análises/inspeções no contrato final não consomem chamada de ferramenta; source_followup reserva contexto. Reservas não obrigam testes ou achados e não ampliam as 12 reproduções globais.',
               'protected_records': {n: object_hash(store.get(manifest.run_id, n)) for n in _history_names(store, manifest.run_id)},
               'past_calls': [object_hash(c) for c in ledger],
@@ -127,7 +128,7 @@ def build_distribution(store, manifest, config, reviewer):
 
 
 def validate_distribution(store, manifest, config, record):
-    if record.get('version') != VERSION or record.get('id') != object_hash({k: v for k, v in record.items() if k != 'id'}):
+    if record.get('version') not in {VERSION, 'initial-batch-distribution-1'} or record.get('id') != object_hash({k: v for k, v in record.items() if k != 'id'}):
         raise PolicyError('versão/hash de distribuição inválido')
     if any(record.get(k) != v for k, v in _bindings(manifest, config).items()):
         raise PolicyError('distribuição de outro run/fonte/objetivo/configuração')
@@ -146,9 +147,14 @@ def validate_distribution(store, manifest, config, record):
     if record['mapping'] != expected_mapping or record['reserves'] != RESERVES:
         raise PolicyError('mapa/reservas de distribuição divergentes')
     baselines = store.get(manifest.run_id, 'baseline')['ids'] if store.exists(manifest.run_id, 'baseline') else []
-    if record['baseline_ids'] != baselines or len(record['costs']) != len(replacement):
+    legacy = record['version'] == 'initial-batch-distribution-1'
+    baseline_reserve = len(baselines) if legacy else record.get('baseline_reserve')
+    valid_baselines = record['baseline_ids'] == baselines if legacy else set(record['baseline_ids']) <= set(baselines)
+    if (not valid_baselines or type(baseline_reserve) is not int
+        or (not legacy and baseline_reserve != max(1, len(record['baseline_ids'])))
+        or len(record['costs']) != len(replacement)):
         raise PolicyError('evidências/custos de distribuição divergentes')
-    reserve = sum(RESERVES.values()) + len(baselines)
+    reserve = sum(RESERVES.values()) + baseline_reserve
     for batch, cost in zip(replacement, record['costs'], strict=True):
         if (_coverage(cost['source_calls']) != _coverage(batch)
             or cost['minimum_source_calls'] != len(cost['source_calls'])
@@ -205,9 +211,13 @@ def register_distribution(store, manifest, config, record):
     with store.lock(manifest.run_id):
         validate_distribution(store, manifest, config, record)
         _check_started_assignments(store, manifest, record['original_batches'], record['batches'])
+        from .turn_planning import global_plan
+        plan = global_plan(store, manifest, config, initial_batches=record['batches'])
+        if plan['minimum_new_calls'] > plan['calls_available']:
+            raise PolicyError('Redistribuição global inviável: ' + '; '.join(plan['blockers']))
         store.put(manifest.run_id, RECORD, record, immutable=True)
 
 
 def tool_reserves(store, manifest, config):
     current = distribution(store, manifest, config)
-    return dict(current['reserves']) if current else {}
+    return dict(current['reserves']) if current else dict(RESERVES)

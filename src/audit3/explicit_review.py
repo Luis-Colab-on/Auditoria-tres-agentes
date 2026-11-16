@@ -37,8 +37,8 @@ def evidence_references(report, message, criterion):
 
 
 def review_template(report):
-    from .completion import VERSION, context_hash, limitation_messages
-    result = {'draft': True, 'version': VERSION, 'policy': POLICY,
+    from .completion import version_for, context_hash, limitation_messages
+    result = {'draft': True, 'version': version_for(report), 'policy': POLICY,
         'objective': report['manifest']['requirements'], 'context_hash': context_hash(report),
         'reviewer': '', 'scope': {'objective': report['manifest']['requirements'],
             'inventory_hash': object_hash(report['manifest']['files']),

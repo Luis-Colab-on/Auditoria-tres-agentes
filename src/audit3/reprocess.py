@@ -4,7 +4,9 @@ from pathlib import Path
 from .evidence import Store
 from .schemas import Judgment
 from .security import PolicyError, object_hash, digest
-from .workflow import Workflow
+from .phase_validation import PhaseValidator
+from .schemas import RunManifest
+from .config import Config
 from .tools import SourceTools, ToolContext
 from .report import build_report
 from .completion import assess_completion, VERSION
@@ -66,10 +68,12 @@ def response_view(store, run_id, invocation_id, raw, certificates):
         derived_response_selection={'original_sha256': digest(raw), 'not_historical_publication': True})
     view = OverlayStore(store, run_id, {'judgment': output.model_dump(mode='json'),
         'roles/juiz/phases/final': phase, 'assessment/causal-certificates': certificates})
-    workflow = Workflow(view, run_id)
-    tools = SourceTools(view, workflow.manifest, workflow.config, None,
-        ToolContext(run_id, 'juiz', 'final', 'report-validation'))
-    workflow.validate_output(output, tools, final=True)
+    manifest = RunManifest.model_validate(view.get(run_id, 'manifest'))
+    config = Config.model_validate(view.get(run_id, 'config'))
+    validator = PhaseValidator(view, manifest, config, read_only=True)
+    tools = SourceTools(view, manifest, config, None,
+        ToolContext(run_id, 'juiz', 'final', invocation_id), read_before=phase.get('published_at'))
+    validator.validate_output(output, tools, final=True)
     return view
 
 

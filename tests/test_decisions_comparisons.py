@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from audit3.comparison import read_comparison, register_comparison
 from audit3.report import build_report, export_zip
-from audit3.schemas import Judgment, Opinion, Verdict, EvidenceReceipt, SourceRef
+from audit3.schemas import Judgment, Opinion, Verdict, EvidenceReceipt, SourceRef, DecisionDelivery
 from audit3.security import PolicyError, digest, object_hash, now
 from audit3.workflow import Workflow
 from helpers import MockRuntime
@@ -16,6 +16,10 @@ def verdict(fid, cause="refund-sign", **kwargs):
     values = dict(finding_id=fid, classification="falha comprovada", decision="corrigir agora", rationale="static flow explicitly contradicts subtraction requirement", evidence_ids=[], proof_method="static",
         impact="balance error", reach="positive refunds", correction_cost="one operator", regression_risk="existing tests cover result", reversibility="small reversible change", test_interpretation="static proof; no executed test claim", mandatory_justification="visible addition contradicts requirement", root_cause_id=cause)
     values.update(kwargs)
+    values['delivery'] = DecisionDelivery(priority='high', priority_rationale='MOCK: resultado monetário incorreto no cenário sintético',
+        proposed_adjustment='MOCK: corrigir o mecanismo estático descrito pelo achado',
+        preserve_behavior='MOCK: manter controles corretos e entradas autorizadas',
+        regression_test='MOCK: testar o cenário que contradiz o invariante e seu controle correto', pending_verification=[])
     return Verdict(**values)
 
 
@@ -23,6 +27,8 @@ def test_new_judge_finding_gets_one_bounded_contestation_round(make_run, monkeyp
     monkeypatch.setattr("audit3.executor.shutil.which", lambda _: None)
     store, m = make_run()
     async def handler(role, phase, payload, tools, final):
+        from helpers import read_phase_context
+        read_phase_context(payload, tools)
         if phase == "review":
             tools.read_source("app.py")
             return Opinion(summary="MOCK new static observation", inspections=[], findings=[finding(m, id="juiz-new")], positions=[], limitations=[])
@@ -41,6 +47,8 @@ def test_new_final_finding_stays_pending_without_mandatory_fix(make_run, monkeyp
     monkeypatch.setattr("audit3.executor.shutil.which", lambda _: None)
     store, m = make_run()
     async def handler(role, phase, payload, tools, final):
+        from helpers import read_phase_context
+        read_phase_context(payload, tools)
         if final:
             tools.read_source("app.py")
             return Judgment(summary="MOCK final discovery", verdicts=[], new_findings=[finding(m, id="juiz-late")], limitations=[])
@@ -84,6 +92,8 @@ def test_defender_findings_are_included_and_duplicate_ids_keep_one_cause(make_ru
         store.put(m.run_id, 'assessment/causal-certificates', certificates)
 
     async def handler(role, phase, payload, tools, final):
+        from helpers import read_phase_context
+        read_phase_context(payload, tools)
         if phase.startswith("initial"):
             opinion = initial_investigation(store, m, role)
             opinion.findings = [findings[role]]
@@ -112,6 +122,9 @@ def test_defender_findings_are_included_and_duplicate_ids_keep_one_cause(make_ru
     assert report['causal_validation']['valid']
     assert len(report['proven_causal_groups']) == 1
     assert len(report['proven_causal_groups'][0]['proofs']) == 2
+    assert all(row['priority']=='high' and row['priority_origin']=='judge_assessment'
+        and row['locations'][0]['excerpt'] and row['proposed_adjustment']
+        and row['preserve_behavior'] and row['regression_test'] for row in report['decision_delivery'])
     assert store.path(m.run_id, 'source/app.py').read_bytes() == source
 
 

@@ -6,16 +6,21 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from .agents import RuntimePaused
+from .agents import RuntimePaused, BudgetExceeded
+from .security import digest
 
 CLI_VERSION = "0.167.0"
 BACKEND = "codex-app-server"
 ALLOWED_METHODS = frozenset({'initialize', 'initialized', 'config/read', 'account/read',
-    'model/list', 'account/rateLimits/read', 'thread/start', 'thread/resume', 'turn/start', 'turn/interrupt'})
+    'model/list', 'account/rateLimits/read', 'thread/start', 'thread/resume', 'thread/turns/list', 'turn/start', 'turn/interrupt'})
 
 
 class DispatchExpired(TimeoutError):
     """The new request was blocked before writing any bytes."""
+
+
+def encode_message(value):
+    return (json.dumps(value, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
 
 
 @dataclass
@@ -25,6 +30,9 @@ class TurnDispatch:
     financial_guard: Callable[[], object]
     write_attempted: bool = False
     written: bool = False
+    max_request_bytes: int | None = None
+    wire_bytes: int | None = None
+    wire_sha256: str | None = None
 
     def check(self):
         # Recheck the factual wall-clock expiry as well as the immutable
@@ -93,8 +101,11 @@ class StdioRPC:
             raise RuntimePaused('RPC fora do escopo: operações de conta/faturamento e alternativas não autorizadas são bloqueadas')
         if data.get('method') == 'turn/start' and not isinstance(dispatch, TurnDispatch):
             raise RuntimePaused('turn/start exige proteção explícita de prazo no despacho')
-        wire = (json.dumps(data, ensure_ascii=False) + "\n").encode()
+        wire = encode_message(data)
         if dispatch is not None:
+            dispatch.wire_bytes, dispatch.wire_sha256 = len(wire), digest(wire)
+            if dispatch.max_request_bytes is not None and len(wire) > dispatch.max_request_bytes:
+                raise BudgetExceeded('Requisição RPC excede limite de entrada; nenhum byte enviado')
             dispatch.check()
             # Once write is attempted, an exception may mean a partial write.
             # Only a guard/serialization failure proves that nothing was sent.

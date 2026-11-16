@@ -63,6 +63,12 @@ contestação, mudança de posição e decisão sugerida. `Verdict` tem classifi
 decisão independentes, avaliação de impacto/alcance/custo/regressão/reversibilidade,
 interpretação do teste e justificativa de obrigatoriedade.
 
+Novos julgamentos exigem também `Verdict.delivery`: prioridade fundamentada,
+ajuste proposto quando necessário, comportamento a preservar, regressão e
+verificações pendentes para hipóteses. O campo é opcional na leitura de históricos;
+informação ausente não é preenchida retroativamente. O relatório novo usa schema
+`2.0`; os contratos originais dos registros permanecem legíveis.
+
 `positions.finding_id` pode referenciar um achado da própria resposta, depois de
 esse achado passar por todas as validações de identidade, fonte, leitura e
 evidências. Em `initial-*` e `blind`, só são admitidos esses achados e os anteriores
@@ -98,8 +104,8 @@ Truncamentos e linhas grandes omitidas ficam explícitos. Listar arquivos não c
 como leitura; ler não conta como análise. Testes executados são contados separadamente
 pelos receipts. Não se infere cobertura de código executado sem instrumentação própria.
 
-Estados operacionais: prepared, running, completed, partial, failed, cancelled.
-Na avaliação `scoped-assessment-2`, `completed` significa conclusão do escopo,
+Estados operacionais: prepared, running, completed, partial, blocked, failed, cancelled.
+Na avaliação atual `scoped-assessment-6` (5 para o formato histórico), `completed` significa conclusão do escopo,
 inclusive quando há defeitos comprovados. `completion_assessment` separa bloqueios
 estruturados (cobertura, fases pendentes, julgamento ausente e achados sem
 contraditório) das notas. Todas as mensagens, inclusive limitações internas de
@@ -108,6 +114,11 @@ continuam bloqueantes. Uma revisão explícita do controlador, vinculada ao hash
 contexto e ao objetivo, pode justificar `scope_note` ou `procedure_note` com
 referências às evidências; não há descarte por palavras-chave. Essa revisão nunca
 suprime uma lacuna estruturada ou uma fase obrigatória ainda pendente.
+
+Entrada lógica, intenção de despacho, confirmação da resposta, publicação da fase
+e índices agregados têm registros distintos. A recuperação e o planejamento global
+estão descritos em [planejamento e retomada](planejamento-retomada.md). `report` e
+reprocessamento usam o validador compartilhado sem construir o controlador de execução.
 
 Agrupamentos causais não dependem de igualdade textual, localização ou rótulo do
 Juiz. Certificados separados do controlador identificam versão da fonte, função,

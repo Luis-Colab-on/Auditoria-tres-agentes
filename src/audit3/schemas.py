@@ -63,7 +63,7 @@ class RunManifest(Contract):
     prompt_hashes: dict[str, str]
     requirements: str
     limitations: list[str] = Field(default_factory=list)
-    estimated_input_tokens: int
+    estimated_input_tokens: int | None
     estimated_calls: int
     prior_report_policy: str = "quarentena até publicação dos três pareceres iniciais"
     acquisition_review_hash: str | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -145,6 +145,24 @@ class Opinion(Contract):
     limitations: list[str]
 
 
+class DecisionDelivery(Contract):
+    """Structured reviewer judgment, not controller-certified severity."""
+    priority: Literal['critical', 'high', 'medium', 'low', 'not_applicable']
+    priority_rationale: str = Field(min_length=1)
+    proposed_adjustment: str | None
+    preserve_behavior: str = Field(min_length=1)
+    regression_test: str = Field(min_length=1)
+    pending_verification: list[str]
+
+    @model_validator(mode='after')
+    def meaningful_fields(self):
+        if any(not value.strip() for value in (self.priority_rationale, self.preserve_behavior, self.regression_test)):
+            raise ValueError('Entrega técnica contém justificativa/controle/teste vazio')
+        if self.proposed_adjustment is not None and not self.proposed_adjustment.strip():
+            raise ValueError('Ajuste proposto vazio')
+        return self
+
+
 class Verdict(Contract):
     finding_id: str
     classification: Classification
@@ -160,6 +178,7 @@ class Verdict(Contract):
     test_interpretation: str
     mandatory_justification: str | None
     root_cause_id: str | None
+    delivery: DecisionDelivery | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @model_validator(mode="after")
     def justified(self):

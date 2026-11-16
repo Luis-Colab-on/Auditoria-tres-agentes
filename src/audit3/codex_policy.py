@@ -182,6 +182,44 @@ def financial_check(proof, identity, quota):
         'atomic_financial_guard': False, 'ordinary_usage_allowed': True}
 
 
+def financial_notification_check(params):
+    """A received negative observation wins over an older positive snapshot.
+
+    Passing this check never approves generation: a full official read is still
+    required. Notifications may omit ordinaryUsageAllowed and credit fields.
+    """
+    if not isinstance(params, dict):
+        raise RuntimePaused('Observabilidade de quota perdida em atualização recebida')
+    if 'ordinaryUsageAllowed' in params and params['ordinaryUsageAllowed'] is not True:
+        raise RuntimePaused('Atualização recebida bloqueia franquia incluída')
+    for key in ('rateLimitsByLimitId', 'rateLimits'):
+        if key in params and params[key] is not None and not isinstance(params[key], dict):
+            raise RuntimePaused('Observabilidade de quota inválida em atualização recebida')
+    buckets = list((params.get('rateLimitsByLimitId') or {}).values())
+    if isinstance(params.get('rateLimits'), dict):
+        buckets.append(params['rateLimits'])
+    for bucket in buckets:
+        if not isinstance(bucket, dict):
+            raise RuntimePaused('Observabilidade de quota inválida em atualização recebida')
+        if bucket.get('spendControlReached') or bucket.get('rateLimitReachedType'):
+            raise RuntimePaused('Limite oficial recebido; novo despacho bloqueado')
+        credits = bucket.get('credits')
+        if isinstance(credits, dict):
+            if credits.get('hasCredits') is True or credits.get('unlimited') is True:
+                raise RuntimePaused('Créditos adicionais observados; novo despacho bloqueado')
+            if 'balance' in credits:
+                try:
+                    zero = isinstance(credits['balance'], str) and Decimal(credits['balance']).is_zero()
+                except InvalidOperation:
+                    zero = False
+                if not zero:
+                    raise RuntimePaused('Saldo extra recebido incompatível/desconhecido')
+        for name in ('primary', 'secondary'):
+            window = bucket.get(name)
+            if isinstance(window, dict) and type(window.get('usedPercent')) in (int, float) and window['usedPercent'] >= 100:
+                raise RuntimePaused('Quota esgotada em atualização recebida')
+
+
 def check_effective_config(config, home):
     import tomllib
     expected = tomllib.loads(private_config(home).decode())

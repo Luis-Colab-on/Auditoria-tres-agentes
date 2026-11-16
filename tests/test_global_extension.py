@@ -1,6 +1,7 @@
 """Offline tests of a final-only time extension; no real model or Docker."""
 import asyncio
 import copy
+import json
 from datetime import datetime, timedelta, timezone
 import pytest
 from audit3.config import Config, Limits
@@ -67,6 +68,19 @@ def setup_extension(make_run):
     store.put(m.run_id, GLOBAL_AUTHORIZATION, auth)
     authorize_turn(store, m)
     tools = SourceTools(store, m, cfg, None, ToolContext(m.run_id, 'juiz', 'final', 'a' * 24))
+    request = rpc.request
+    async def consume_context(method, params, **kwargs):
+        response = await request(method, params, **kwargs)
+        if method == 'turn/start':
+            payload = json.loads(params['input'][0]['text']); finish = []
+            while not rpc.events.empty(): finish.append(rpc.events.get_nowait())
+            for n, page in enumerate(payload.get('required_context_pages', [])):
+                rpc.events.put_nowait({'id':n,'method':'item/tool/call','params':{
+                    'threadId':params['threadId'],'turnId':response['turn']['id'],
+                    'tool':'read_evidence','arguments':{'evidence_id':page}}})
+            for event in finish:rpc.events.put_nowait(event)
+        return response
+    rpc.request = consume_context
     return store, m, runtime, rpc, tools, auth
 
 
@@ -83,9 +97,13 @@ def test_extension_continues_only_final_and_preserves_all_old_calls_and_phases(m
             assert params['threadId'] == store.get(m.run_id, 'roles/juiz/codex-session')['thread_id']
             assert params['outputSchema']['title'] == 'Judgment'
             # Replace the MOCK default Opinion with the final contract.
-            while not rpc.events.empty(): rpc.events.get_nowait()
+            tool_calls = []
+            while not rpc.events.empty():
+                event = rpc.events.get_nowait()
+                if event.get('method') == 'item/tool/call': tool_calls.append(event)
             turn = result['turn']['id']; base = {'threadId': params['threadId'], 'turnId': turn}
             output = Judgment(summary='MOCK final', baseline_assessment='MOCK', verdicts=[], new_findings=[], limitations=[]).model_dump_json()
+            for event in tool_calls: rpc.events.put_nowait(event)
             rpc.events.put_nowait({'method': 'item/completed', 'params': {**base, 'item': {'type': 'agentMessage', 'phase': 'final_answer', 'text': output}}})
             rpc.events.put_nowait({'method': 'turn/completed', 'params': {**base, 'turn': {'id': turn, 'status': 'completed'}}})
         return result
@@ -132,6 +150,7 @@ def test_extension_cannot_reset_history_or_ignore_pending_work(make_run, tamper)
 
 def test_extension_forbids_new_inference_for_other_phases(make_run):
     store, m, runtime, rpc, tools, auth = setup_extension(make_run)
+    tools = SourceTools(store,m,runtime.config,tools.executor,ToolContext(m.run_id,'auditor','contest',tools.context.invocation_id))
     with pytest.raises(PolicyError, match='somente juiz/final'):
         asyncio.run(runtime.invoke('auditor', 'contest', {}, tools))
     assert not any(method == 'turn/start' for method, _ in rpc.calls)

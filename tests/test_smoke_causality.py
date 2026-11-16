@@ -184,13 +184,25 @@ def test_failed_setup_is_rejected_before_smoke_contract_is_published(smoke_run):
 def test_workflow_generates_verified_certificates_but_report_validation_never_writes(smoke_run):
     from dataclasses import replace
     from audit3.workflow import Workflow
-    from audit3.schemas import Judgment
+    from audit3.schemas import Judgment, Opinion, AgentPosition
     from test_decisions_comparisons import verdict
     store, manifest, _, executor, marker, tools, findings = prepared(smoke_run)
     for eid in store.get(manifest.run_id, 'baseline')['ids']:
         tools.read_evidence(eid)
     workflow = Workflow(store, manifest.run_id, runtime=object(), executor=executor)
-    workflow.findings = lambda: {f['id']: f for f in findings}
+    # Explicit synthetic allegations and per-ID debate reach the causal check;
+    # this fixture does not claim an independently investigated real audit.
+    for role in ('auditor', 'defensor'):
+        for phase in ('initial-0000', 'contest', 'reply'):
+            opinion = Opinion(summary='MOCK certificate validation input',
+                findings=[f for f in findings if f['id'].startswith(role)] if phase.startswith('initial-') else [],
+                positions=[] if phase.startswith('initial-') else [
+                    AgentPosition(finding_id=f['id'], classification='hipótese não confirmada', decision='investigar',
+                        argument='MOCK: examine receipt and signed subtraction contract',
+                        evidence_ids=f['evidence_ids'], changed_position=False) for f in findings],
+                inspections=[], limitations=[])
+            store.put(manifest.run_id, f'roles/{role}/phases/{phase}',
+                {'role':role,'phase':phase,'published_at':now(),'output':opinion.model_dump(mode='json')})
     judgment = Judgment(summary='Synthetic final contract test only',
         baseline_assessment='Two refunds fail and two positive payments pass in the fixture receipt.',
         verdicts=[verdict(f['id'], cause='one-proposal', evidence_ids=f['evidence_ids'], proof_method='executed')

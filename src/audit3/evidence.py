@@ -64,6 +64,16 @@ class Store:
         event_id = secrets.token_hex(12)
         self.put(run_id, "events/" + event_id, {"at": now(), "kind": kind, "data": data}, immutable=True)
 
+    def event_once(self, run_id: str, kind: str, identity: str, data: dict):
+        """Idempotent durable event; retries retain its original timestamp."""
+        name = 'events/' + object_hash({'kind': kind, 'identity': identity})[:24]
+        if self.exists(run_id, name):
+            previous = self.get(run_id, name)
+            if previous['kind'] != kind or previous['data'] != data:
+                raise PolicyError('evento idempotente divergente')
+            return
+        self.put(run_id, name, {'at': now(), 'kind': kind, 'data': data}, immutable=True)
+
     @contextmanager
     def lock(self, run_id: str):
         path = self.path(run_id, "controller.lock")

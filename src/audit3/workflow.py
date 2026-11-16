@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from importlib.resources import files
 from pydantic import ValidationError
-from .agents import BudgetExceeded, RuntimePaused
+from .agents import BudgetExceeded, RuntimePaused, PersistencePending
 from .codex_runtime import CodexRuntime
 from .codex_policy import financial_policy
 from .config import Config, Profile
@@ -22,23 +22,9 @@ from .operational import total_seconds
 from .investigation import is_blind, validate_initial_output, validate_saved_initial, assess_independent_investigation
 from .batch_distribution import effective_batches, distribution, tool_reserves, assignment_for_phase
 from .agent_context import agent_manifest
-
-
-def batches(manifest: RunManifest, line_limit: int):
-    result, batch, size = [], [], 0
-    for f in manifest.files:
-        if f.category in {"excluded", "prior_report"} or not f.lines:
-            continue
-        for start in range(1, max(1, f.lines) + 1, line_limit):
-            end = min(f.lines, start + line_limit - 1)
-            if size and size + end - start + 1 > line_limit:
-                result.append(batch)
-                batch, size = [], 0
-            batch.append({"path": f.path, "start": start, "end": end, "sha256": f.sha256})
-            size += max(1, end - start + 1)
-    if batch:
-        result.append(batch)
-    return result or [[]]
+from .phase_validation import PhaseValidator
+from .turn_planning import batches
+from .attempts import freeze_input, original_input, confirmed
 
 
 class Workflow:
@@ -56,6 +42,7 @@ class Workflow:
             if digest(files("audit3").joinpath("prompts", role + ".txt").read_bytes()) != expected:
                 raise PolicyError("prompt mudou: nova auditoria necessária")
         self.runtime, self.executor = runtime, executor or Executor(store, self.manifest, self.config, self.profile)
+        self.validator = PhaseValidator(store, self.manifest, self.config)
         self.semaphore = asyncio.Semaphore(self.config.limits.concurrency)
 
     def state(self):
@@ -66,8 +53,8 @@ class Workflow:
         state.update(kwargs)
         self.store.put(self.run_id, "state", state)
 
-    def opinions(self, role: str):
-        return [self.store.get(self.run_id, f"roles/{role}/phases/{name}")["output"] for name in self.store.names(self.run_id, f"roles/{role}/phases")]
+    def opinions(self, role):
+        return self.validator.opinions(role)
 
     def shared(self):
         if not self.store.exists(self.run_id, "barrier"):
@@ -75,86 +62,205 @@ class Workflow:
         return {r.value: self.opinions(r.value) for r in Role}
 
     def findings(self):
-        found = {}
-        for role in Role:
-            for opinion in self.opinions(role.value):
-                for finding in opinion.get("findings", []):
-                    if finding["id"] in found and found[finding["id"]]["mechanism"] != finding["mechanism"]:
-                        raise PolicyError("ID reaproveitado para mecanismo diferente")
-                    # Keep the initial allegation; revisions are preserved in positions.
-                    found.setdefault(finding["id"], finding)
-        return found
+        return self.validator.findings()
 
-    def validate_output(self, output, tools: SourceTools, final: bool):
-        if sensitive(json.dumps(output.model_dump(mode="json"), ensure_ascii=False)):
-            raise PolicyError("saída contém possível segredo/PII")
-        if not final:
-            for inspection in output.inspections:
-                tools.validate_inspection(inspection)
-            for finding in output.findings:
-                if not finding.id.startswith(tools.context.role + "-"):
-                    raise PolicyError("ID deve pertencer ao papel")
-                tools.validate_finding(finding)
-                if not (tools.context.phase.startswith("initial") or tools.context.phase in {"blind", "review"}) and finding.id not in self.findings():
-                    raise PolicyError("novo achado tardio sem contraditório: registre limitação para nova auditoria")
-            # Resolve references after validating the response's own findings.
-            # Blind phases can use this role's history, never another role's
-            # unpublished findings merely because it happened to finish first.
-            blind = tools.context.phase.startswith("initial") or tools.context.phase == "blind"
-            known = ({finding["id"] for opinion in self.opinions(tools.context.role)
-                for finding in opinion.get("findings", [])} if blind else set(self.findings()))
-            known.update(finding.id for finding in output.findings)
-            for position in output.positions:
-                if position.finding_id not in known:
-                    raise PolicyError("posição sobre achado inexistente")
-                for eid in position.evidence_ids:
-                    tools.read_evidence(eid, record_access=False)
-            validate_initial_output(output, tools)
+    def validate_output(self, output, tools, final):
+        return self.validator.validate_output(output, tools, final)
+
+    def finish_phase(self, role, phase, record):
+        """Reconcile derived indexes from an already validated durable phase."""
+        role_name = f'roles/{role}/state'
+        role_state = {'phase': phase, 'invocation_id': record.get('invocation_id'), 'status': 'completed'}
+        if self.store.exists(self.run_id, role_name):
+            current = self.store.get(self.run_id, role_name)
+            prior_name = f"roles/{role}/phases/{current['phase']}"
+            if self.store.exists(self.run_id, prior_name):
+                prior = self.store.get(self.run_id, prior_name)
+                if prior.get('published_at', '') > record.get('published_at', ''):
+                    role_state = {'phase': current['phase'], 'invocation_id': prior.get('invocation_id'), 'status': 'completed'}
+        if record.get('invocation_id') and (not self.store.exists(self.run_id, role_name) or self.store.get(self.run_id, role_name) != role_state):
+            self.store.put(self.run_id, role_name, role_state)
+        state = self.state()
+        completed = list(dict.fromkeys([*state['completed'], role + '/' + phase]))
+        if completed != state['completed']:
+            state['completed'] = completed
+            self.store.put(self.run_id, 'state', state)
+
+    def publish_phase(self, role, phase, invocation, result, tools, *, origin='execution'):
+        name = f'roles/{role}/phases/{phase}'
+        cls = Judgment if phase == 'final' else Opinion
+        output = cls.model_validate_json(result) if isinstance(result, str) else cls.model_validate(result)
+        confirmation = confirmed(self.store, self.run_id, invocation, role, phase)
+        if confirmation:
+            if result != confirmation['output']:
+                raise PolicyError('Publicação diverge da resposta confirmada original')
+            tools.read_before = confirmation['finished_at']
+        self.validate_output(output, tools, phase == 'final')
+        record = {'version': 'phase-publication-2', 'role': role, 'phase': phase,
+            'invocation_id': invocation, 'published_at': now(), 'mode': self.runtime.mode,
+            'output': output.model_dump(mode='json'), 'publication_origin': origin}
+        if confirmation:
+            record['evidence_cutoff'] = confirmation['finished_at']
+            record['confirmation_hash'] = object_hash(confirmation)
+        if self.store.exists(self.run_id, 'turn-inputs/' + invocation):
+            record['input_hash'] = self.store.get(self.run_id, 'turn-inputs/' + invocation)['input_hash']
+        current = distribution(self.store, self.manifest, self.config)
+        if current:
+            record['batch_distribution_id'] = current['id']
+        try:
+            self.store.put(self.run_id, name, record, immutable=True)
+            self.finish_phase(role, phase, record)
+        except OSError as exc:
+            if confirmation:
+                raise PersistencePending(invocation) from exc
+            raise
+        return record['output']
+
+    async def reconcile(self):
+        """Repair local publication/index work only; never dispatch or execute."""
+        if self.runtime is None:
+            self.runtime = CodexRuntime(self.store, self.run_id, self.config)
+        if isinstance(self.runtime, CodexRuntime):
+            await self.runtime.budget.reconcile()
+        repaired, pending = [], []
+        for role in Role:
+            role = role.value
+            for phase in self.store.names(self.run_id, f'roles/{role}/phases'):
+                record = self.store.get(self.run_id, f'roles/{role}/phases/{phase}')
+                self.validator.validate_record(record, role, phase)
+                if is_blind(phase):
+                    validate_saved_initial(self.store, self.manifest, self.config, role, phase)
+                else:
+                    tools = SourceTools(self.store, self.manifest, self.config, None,
+                        ToolContext(self.run_id, role, phase, record.get('invocation_id', 'historical-phase-validation')),
+                        read_before=record['published_at'])
+                    self.validate_output((Judgment if phase == 'final' else Opinion).model_validate(record['output']), tools, phase == 'final')
+                self.finish_phase(role, phase, record)
+            import re
+            for name in self.store.names(self.run_id, f'roles/{role}/attempts'):
+                match = re.fullmatch(r'(.+)-(\d+)', name)
+                if not match:
+                    continue
+                phase, slot = match[1], int(match[2])
+                path = f'roles/{role}/phases/{phase}'
+                if self.store.exists(self.run_id, path) or self.store.exists(self.run_id, f'roles/{role}/attempts/{name}-rejected'):
+                    continue
+                attempt = self.store.get(self.run_id, f'roles/{role}/attempts/{name}')
+                invocation = attempt['invocation_id']
+                checkpoint = 'codex-turns/' + invocation
+                if not self.store.exists(self.run_id, checkpoint):
+                    continue
+                cp = self.store.get(self.run_id, checkpoint)
+                result = confirmed(self.store, self.run_id, invocation, role, phase)
+                if result is None and cp.get('status') != 'completed':
+                    pending.append({'invocation_id': invocation, 'role': role, 'phase': phase, 'status': cp['status']})
+                    continue
+                if not self.store.exists(self.run_id, 'turn-inputs/' + invocation):
+                    pending.append({'invocation_id': invocation, 'status': 'historical_input_unavailable'})
+                    continue
+                assignment = assignment_for_phase(self.store, self.manifest, self.config, phase) if phase.startswith('initial-') else None
+                payload = original_input(self.store, self.manifest, role, phase, invocation, assignment)
+                result = result or cp
+                if result['input_hash'] != object_hash(payload):
+                    raise PolicyError('Entrada original diverge da resposta concluída')
+                output = await self.runtime.complete_local(result)
+                tools = SourceTools(self.store, self.manifest, self.config, self.executor,
+                    ToolContext(self.run_id, role, phase, invocation, slot))
+                try:
+                    self.publish_phase(role, phase, invocation, output, tools, origin='local_recovery')
+                except (ValidationError, PolicyError, json.JSONDecodeError) as exc:
+                    if isinstance(exc, RuntimePaused):
+                        raise
+                    rejection = {'error_type': type(exc).__name__, 'feedback': 'Saída rejeitada: ' + redact(str(exc))[:1500]}
+                    self.store.put(self.run_id, f'roles/{role}/attempts/{name}-rejected', rejection, immutable=True)
+                    self.store.event_once(self.run_id, 'invalid_output', invocation,
+                        {'role': role, 'phase': phase, 'attempt': slot, 'error_type': type(exc).__name__})
+                    pending.append({'invocation_id': invocation, 'role': role, 'phase': phase, 'status': 'completed_output_invalid'})
+                    continue
+                repaired.append(role + '/' + phase)
+        if self.store.exists(self.run_id, 'roles/juiz/phases/final') and not self.store.exists(self.run_id, 'judgment'):
+            self.store.put(self.run_id, 'judgment', self.store.get(self.run_id, 'roles/juiz/phases/final')['output'], immutable=True)
+        from .turn_planning import global_plan
+        if (self.store.exists(self.run_id, 'judgment') and not global_plan(self.store, self.manifest, self.config)['pending_phases']
+            and self.state().get('phase') != 'done'):
+            self.finalize(self.store.get(self.run_id, 'judgment'))
+        return {'repaired_phases': repaired, 'pending': pending, 'new_model_calls': 0}
+
+    def resolve_local_persistence(self):
+        state = self.state()
+        resolved = []
+        for block in state.get('operational_blockers', []):
+            inv = block.get('invocation_id')
+            if block.get('kind') != 'local_persistence' or not inv:
+                continue
+            result = confirmed(self.store, self.run_id, inv)
+            if result and self.store.exists(self.run_id, f"roles/{result['role']}/phases/{result['phase']}"):
+                resolved.append(block)
+        if not resolved:
             return
-        known = self.findings()
-        if self.store.exists(self.run_id, "baseline"):
-            for eid in self.store.get(self.run_id, "baseline")["ids"]:
-                receipt = tools.read_evidence(eid, record_access=False)["receipt"]
-                if receipt["status"] in {"passed", "failed"}:
-                    tools.require_evidence_consulted(eid)
-                    if not output.baseline_assessment or not output.baseline_assessment.strip():
-                        raise PolicyError("Juiz precisa avaliar testes de base e suas expectativas, inclusive divergências")
-        if {v.finding_id for v in output.verdicts} != set(known) or len(output.verdicts) != len(known):
-            raise PolicyError("cada achado exige exatamente uma decisão")
-        for verdict in output.verdicts:
-            finding = known[verdict.finding_id]
-            # Judge has to consult source directly, including initially raised findings.
-            from .schemas import SourceRef
-            for ref in finding["refs"]:
-                tools.validate_ref(SourceRef.model_validate(ref))
-            for eid in verdict.evidence_ids:
-                tools.read_evidence(eid, record_access=False)
-                tools.require_evidence_consulted(eid)
-            if verdict.classification == Classification.PROVEN:
-                if verdict.proof_method == "executed":
-                    if not verdict.evidence_ids:
-                        raise PolicyError("falha executada sem receipt")
-                    for eid in verdict.evidence_ids:
-                        r = tools.read_evidence(eid, record_access=False)["receipt"]
-                        if r["execution"] not in {"docker", "compose"} or r["status"] not in {"passed", "failed"}:
-                            raise PolicyError("receipt não prova execução")
-                if verdict.proof_method == "static" and not finding.get("static_demonstration"):
-                    raise PolicyError("falta demonstração estática verificável")
-        for finding in output.new_findings:
-            tools.validate_finding(finding)
-        certificate_name = 'assessment/causal-certificates'
-        prepare_certificates = (self.store.exists(self.run_id, 'assessment/smoke-contract')
-            and tools.context.invocation_id != 'report-validation')
-        if prepare_certificates:
-            from .smoke_causality import certificates_for_smoke
-            candidates = [known[v.finding_id] for v in output.verdicts if v.classification == Classification.PROVEN]
-            certificates = certificates_for_smoke(self.store, self.manifest, candidates, tools)
-        else:
-            certificates = self.store.get(self.run_id, certificate_name) if self.store.exists(self.run_id, certificate_name) else []
-        causal_groups(list(known.values()), [v.model_dump(mode='json') for v in output.verdicts],
-            tools, tools.source_bytes_for_validation, certificates)
-        if prepare_certificates:
-            self.store.put(self.run_id, certificate_name, certificates, immutable=True)
+        record = {'version': 'local-persistence-reconciliation-1', 'source_id': self.manifest.source_id,
+                  'original_state': state, 'resolved': resolved,
+                  'confirmation_hashes': {b['invocation_id']: object_hash(confirmed(self.store, self.run_id, b['invocation_id'])) for b in resolved}}
+        identity = object_hash(record)
+        self.store.put(self.run_id, 'reconciliations/' + identity, record, immutable=True)
+        remaining = [b for b in state['operational_blockers'] if b not in resolved]
+        messages = {b['message'] for b in resolved} - {b['message'] for b in remaining}
+        state.update(operational_blockers=remaining,
+                     limitations=[t for t in state.get('limitations', []) if t not in messages],
+                     reconciliation_records=[*state.get('reconciliation_records', []), identity])
+        if not remaining and state['status'] in {'failed', 'blocked'}:
+            state['status'] = 'running'  # Local commit completion; no execution is started.
+        self.store.put(self.run_id, 'state', state)
+
+    def build_payload(self, role, phase, assignment, current_distribution, feedback=None):
+        payload = {"phase": phase, "role": role, "manifest": agent_manifest(
+            self.store, self.manifest, self.store.exists(self.run_id, 'barrier')),
+            "financial_restriction": financial_policy(),
+            "assignment": assignment, "own_observations": self.opinions(role) if self.runtime.mode != "codex-app-server" else [],
+            "baseline_receipts": self.store.get(self.run_id, "baseline")["ids"],
+            "comparison_ids": self.store.names(self.run_id, "comparisons"),
+            "instruction": "Leia os intervalos atribuídos via ferramentas. Declare lacunas. Em debate retorne posições; final exige decisão por achado."}
+        if current_distribution:
+            payload['batch_distribution_id'] = current_distribution['id']
+        if self.runtime.mode == 'codex-app-server' and self.opinions(role):
+            from .context_pages import create_reference
+            payload['own_observations'] = create_reference(self.store, self.manifest, self.config,
+                self.opinions(role), phase=phase, audience=[role], kind='own_history')
+        if self.store.exists(self.run_id, "assessment/smoke-contract"):
+            from .smoke_causality import check_marker
+            marker = check_marker(self.store, self.manifest)
+            payload["smoke_evidence_instruction"] = {
+                "receipt_id": marker["receipt_id"],
+                "instruction": "Consulte os receipts de base pelas ferramentas. Se um achado usar essa evidência, "
+                    "cite seu ID e referências que cubram a função examinada inteira. Registre somente o que "
+                    "a fonte e as observações sustentam; nenhum achado é obrigatório."}
+        if self.store.exists(self.run_id, "barrier"):
+            phase_input = f"phase-inputs/{phase}"
+            from .context_pages import create_reference
+            ref = create_reference(self.store, self.manifest, self.config, {
+                'published_opinions': self.store.get(self.run_id, phase_input) if self.store.exists(self.run_id, phase_input) else self.shared(),
+                'finding_ids': list(self.findings()), 'receipt_ids': self.store.names(self.run_id, 'receipts')},
+                phase=phase, audience=[r.value for r in Role], kind='discussion')
+            payload['published_opinions'] = ref
+            payload['required_context_pages'] = ref['page_ids']
+            if len(ref['page_ids']) > self.config.limits.max_turns:
+                raise BudgetExceeded(f"Contexto obrigatório exige {len(ref['page_ids'])} ferramentas; teto {self.config.limits.max_turns}")
+        if self.runtime.mode == 'codex-app-server' and phase.startswith('initial-') and isinstance(assignment, list):
+            from .turn_planning import initial_read_plan
+            planning_tools = SourceTools(self.store, self.manifest, self.config, None,
+                ToolContext(self.run_id, role, phase, 'controller-planning'))
+            plan = initial_read_plan(planning_tools, assignment, payload['baseline_receipts'],
+                                     reserves=tool_reserves(self.store, self.manifest, self.config))
+            if not plan['mandatory_reads_fit']:
+                raise BudgetExceeded('lote inicial inviável no limite de ferramentas: '
+                    f"mínimo {plan['minimum_tool_calls']}, teto {plan['max_tool_calls']}, "
+                    f"linhas não materializáveis {len(plan['unreadable_lines'])}; replanejamento necessário, sem nova chamada")
+            payload['initial_read_plan'] = plan
+        # The effective, selected context is measured by the runtime after
+        # paging/catalog selection and factual financial data are added.
+        if feedback:
+            payload['validation_feedback'] = feedback
+        return payload
 
     async def invoke(self, role: str, phase: str, assignment=None, final=False):
         current_distribution = distribution(self.store, self.manifest, self.config)
@@ -167,79 +273,24 @@ class Workflow:
         if self.store.exists(self.run_id, name):
             if is_blind(phase):
                 validate_saved_initial(self.store, self.manifest, self.config, role, phase, assignment if isinstance(assignment, list) else None)
-            return self.store.get(self.run_id, name)["output"]
+            record = self.store.get(self.run_id, name)
+            self.validator.validate_record(record, role, phase)
+            self.finish_phase(role, phase, record)
+            return record['output']
         async with self.semaphore:
             if self.store.exists(self.run_id, "cancel"):
                 raise asyncio.CancelledError
             self.update(phase=phase)
-            payload = {"phase": phase, "role": role, "manifest": agent_manifest(
-                self.store, self.manifest, self.store.exists(self.run_id, 'barrier')),
-                "financial_restriction": financial_policy(),
-                "assignment": assignment, "own_observations": self.opinions(role) if self.runtime.mode != "codex-app-server" else [],
-                "baseline_receipts": self.store.get(self.run_id, "baseline")["ids"],
-                "comparison_ids": self.store.names(self.run_id, "comparisons"),
-                "instruction": "Leia os intervalos atribuídos via ferramentas. Declare lacunas. Em debate retorne posições; final exige decisão por achado."}
-            if current_distribution:
-                payload['batch_distribution_id'] = current_distribution['id']
-            if self.store.exists(self.run_id, "assessment/smoke-contract"):
-                from .smoke_causality import check_marker
-                marker = check_marker(self.store, self.manifest)
-                payload["smoke_evidence_instruction"] = {
-                    "receipt_id": marker["receipt_id"],
-                    "instruction": "Consulte os receipts de base pelas ferramentas. Se um achado usar essa evidência, "
-                        "cite seu ID e referências que cubram a função examinada inteira. Registre somente o que "
-                        "a fonte e as observações sustentam; nenhum achado é obrigatório."}
-            if self.store.exists(self.run_id, "barrier"):
-                phase_input = f"phase-inputs/{phase}"
-                payload["published_opinions"] = self.store.get(self.run_id, phase_input) if self.store.exists(self.run_id, phase_input) else self.shared()
-                payload["finding_ids"] = list(self.findings())
-                payload["receipt_ids"] = self.store.names(self.run_id, "receipts")
-            if self.runtime.mode == 'codex-app-server' and phase.startswith('initial-') and isinstance(assignment, list):
-                from .turn_planning import initial_read_plan
-                planning_tools = SourceTools(self.store, self.manifest, self.config, None,
-                    ToolContext(self.run_id, role, phase, 'controller-planning'))
-                plan = initial_read_plan(planning_tools, assignment, payload['baseline_receipts'],
-                                         reserves=tool_reserves(self.store, self.manifest, self.config))
-                if not plan['mandatory_reads_fit']:
-                    raise BudgetExceeded('lote inicial inviável no limite de ferramentas: '
-                        f"mínimo {plan['minimum_tool_calls']}, teto {plan['max_tool_calls']}, "
-                        f"linhas não materializáveis {len(plan['unreadable_lines'])}; replanejamento necessário, sem nova chamada")
-                payload['initial_read_plan'] = plan
-            if len(json.dumps(payload, ensure_ascii=False).encode()) > self.config.limits.max_input_bytes:
-                raise BudgetExceeded("entrada excede limite: cobertura parcial; reduza escopo numa nova preparação")
-            attempt_count = self.config.limits.invalid_output_retries + 1
-            authorization_name = name.replace('/phases/', '/attempts/') + '-extra-authorization'
-            if self.store.exists(self.run_id, authorization_name):
-                authorization = self.store.get(self.run_id, authorization_name)
-                expected = {'source': 'explicit_operator_authorization', 'run_id': self.run_id,
-                    'role': role, 'phase': phase, 'additional_attempts': 1,
-                    'attempt_slot': attempt_count, 'config_hash': self.manifest.config_hash}
-                previous_name = name.replace('/phases/', '/attempts/') + f'-{attempt_count - 1}'
-                if (any(authorization.get(key) != value for key, value in expected.items())
-                    or not all(self.store.exists(self.run_id, name.replace('/phases/', '/attempts/') + f'-{i}') for i in range(attempt_count))
-                    or authorization.get('previous_invocation_id') != self.store.get(self.run_id, previous_name)['invocation_id']
-                    or not self.store.exists(self.run_id, previous_name + '-interrupted')):
-                    raise RuntimePaused('Exceção de tentativa adicional inválida; retomada bloqueada')
-                if 'prior_attempts' in authorization:
-                    prior_attempts = authorization['prior_attempts']
-                    if not isinstance(prior_attempts, list) or len(prior_attempts) != attempt_count:
-                        raise RuntimePaused('Vinculação das tentativas anteriores inválida')
-                    for slot, prior in enumerate(prior_attempts):
-                        old_name = name.replace('/phases/', '/attempts/') + f'-{slot}'
-                        old = self.store.get(self.run_id, old_name)
-                        old_turn = self.store.get(self.run_id, 'codex-turns/' + old['invocation_id'])
-                        if prior != {'slot': slot, 'invocation_id': old['invocation_id'],
-                                     'attempt_hash': object_hash(old), 'checkpoint_hash': object_hash(old_turn)}:
-                            raise RuntimePaused('Vinculação das tentativas anteriores inválida')
-                # One immutable authorization permits one fixed slot for this
-                # role/phase only. Its checkpoint prevents replay after failure.
-                attempt_count += 1
-            from .recovery_authorization import chained_attempt_count
-            attempt_count = chained_attempt_count(self.store, self.manifest, self.config,
-                role, phase, attempt_count, authorization_name)
+            payload, feedback = None, None
+            from .recovery_authorization import attempt_limit
+            attempt_count = attempt_limit(self.store, self.manifest, self.config, role, phase)
             for attempt in range(attempt_count):
                 attempt_name = name.replace("/phases/", "/attempts/") + f"-{attempt}"
                 if self.store.exists(self.run_id, attempt_name):
+                    if self.store.exists(self.run_id, 'recovery-decisions/' + self.store.get(self.run_id, attempt_name)['invocation_id']):
+                        from .recovery import validate_decision
+                        validate_decision(self.store, self.manifest, self.store.get(self.run_id, attempt_name)['invocation_id'])
+                        continue
                     if self.store.exists(self.run_id, attempt_name + '-interrupted'):
                         # Explicit operator recovery after an official terminal-state
                         # check. It consumes an existing slot; never creates retries.
@@ -255,12 +306,16 @@ class Workflow:
                     if self.store.exists(self.run_id, attempt_name + "-rejected"):
                         rejected = self.store.get(self.run_id, attempt_name + "-rejected")
                         if rejected.get("feedback"):
-                            payload["validation_feedback"] = rejected["feedback"]
+                            feedback = rejected["feedback"]
                         continue
                     if self.runtime.mode != "codex-app-server":
                         continue
                     previous_attempt = self.store.get(self.run_id, attempt_name)
                     invocation_id = previous_attempt['invocation_id']
+                    if self.store.exists(self.run_id, 'turn-inputs/' + invocation_id):
+                        payload = original_input(self.store, self.manifest, role, phase, invocation_id, assignment)
+                    else:
+                        payload = self.build_payload(role, phase, assignment, current_distribution, feedback)
                     if current_distribution and not self.store.exists(self.run_id, 'codex-turns/' + invocation_id):
                         if any(c.get('invocation_id') == invocation_id for c in self.store.get(self.run_id, 'ledger')['calls']):
                             raise RuntimePaused('Reserva anterior sem checkpoint: revisão explícita necessária, sem nova reserva')
@@ -278,18 +333,25 @@ class Workflow:
                                 'previous_checkpoint_absent': True, 'previous_reservation_absent': True}, immutable=True)
                 else:
                     invocation_id = secrets.token_hex(12)
+                    payload = self.build_payload(role, phase, assignment, current_distribution, feedback)
+                if self.store.exists(self.run_id, 'turn-inputs/' + invocation_id):
+                    payload = original_input(self.store, self.manifest, role, phase, invocation_id, assignment)
+                else:
+                    checkpoint_name = 'codex-turns/' + invocation_id
+                    if self.store.exists(self.run_id, checkpoint_name) and self.store.get(self.run_id, checkpoint_name).get('input_hash') != object_hash(payload):
+                        raise RuntimePaused('Entrada histórica original indisponível; não reconstruir com evidências novas')
+                    freeze_input(self.store, self.manifest, role, phase, invocation_id, payload, assignment)
                 tools = SourceTools(self.store, self.manifest, self.config, self.executor, ToolContext(self.run_id, role, phase, invocation_id, attempt))
                 if not self.store.exists(self.run_id, attempt_name):
-                    attempt_record = {"invocation_id": invocation_id, "started_at": now(), "input_hash": object_hash(payload)}
+                    attempt_record = {"version": "phase-attempt-2", "invocation_id": invocation_id, "started_at": now(), "input_hash": object_hash(payload),
+                                      'input_record': 'turn-inputs/' + invocation_id}
                     if current_distribution:
                         attempt_record['batch_distribution_id'] = current_distribution['id']
                     self.store.put(self.run_id, attempt_name, attempt_record, immutable=True)
                 self.store.put(self.run_id, f"roles/{role}/state", {"phase": phase, "invocation_id": invocation_id, "status": "running"})
                 try:
                     result = await self.runtime.invoke(role, phase, payload, tools, final=final)
-                    cls = Judgment if final else Opinion
-                    output = cls.model_validate_json(result) if isinstance(result, str) else cls.model_validate(result)
-                    self.validate_output(output, tools, final)
+                    return self.publish_phase(role, phase, invocation_id, result, tools)
                 except RuntimePaused:
                     raise
                 except (ValidationError, PolicyError, json.JSONDecodeError) as exc:
@@ -297,17 +359,8 @@ class Workflow:
                     self.store.event(self.run_id, "invalid_output", {"role": role, "phase": phase, "error_type": type(exc).__name__, "attempt": attempt})
                     if attempt == attempt_count - 1:
                         raise PolicyError("saída inválida após limite de correções") from exc
-                    payload["validation_feedback"] = "Saída rejeitada: " + redact(str(exc))[:1500]
+                    feedback = "Saída rejeitada: " + redact(str(exc))[:1500]
                     continue
-                record = {"role": role, "phase": phase, "invocation_id": invocation_id, "published_at": now(), "mode": self.runtime.mode, "output": output.model_dump(mode="json")}
-                if current_distribution:
-                    record['batch_distribution_id'] = current_distribution['id']
-                self.store.put(self.run_id, name, record, immutable=True)
-                self.store.put(self.run_id, f"roles/{role}/state", {"phase": phase, "invocation_id": invocation_id, "status": "completed"})
-                state = self.state()
-                state["completed"].append(role + "/" + phase)
-                self.store.put(self.run_id, "state", state)
-                return record["output"]
             raise PolicyError("tentativas desta fase esgotadas; nenhuma chamada repetida automaticamente")
 
     async def independent(self, role: str):
@@ -332,6 +385,8 @@ class Workflow:
 
     async def body(self):
         verify_source(self.store, self.manifest)
+        from .turn_planning import ensure_global_capacity
+        ensure_global_capacity(self.store, self.manifest, self.config)
         if not self.store.exists(self.run_id, "baseline"):
             r = await self.executor.execute(TestRequest(kind="baseline", purpose="testes de base factuais do snapshot"), "baseline", "baseline")
             self.store.put(self.run_id, "baseline", {"ids": [r.id]}, immutable=True)
@@ -346,7 +401,9 @@ class Workflow:
                     raise BudgetExceeded(f"lote inicial inviável {entry['role']}/{entry['phase']}: "
                         f"mínimo {entry['plan']['minimum_tool_calls']} leituras, teto {self.config.limits.max_turns}; "
                         'replanejamento necessário antes de qualquer nova chamada')
-        if hasattr(self.runtime, "preflight"):
+        # A cached response/phase is local recovery, not a new dispatch. The
+        # Codex runtime runs the mandatory preflight only for new generation.
+        if not isinstance(self.runtime, CodexRuntime) and hasattr(self.runtime, 'preflight'):
             await self.runtime.preflight()
         self.update(runtime_mode=self.runtime.mode)
         if not self.store.exists(self.run_id, "barrier"):
@@ -391,8 +448,12 @@ class Workflow:
             await self.paired("extra-contest")
             await self.paired("extra-reply")
         result = await self.invoke("juiz", "final", final=True)
+        self.finalize(result)
+
+    def finalize(self, result):
         self.store.put(self.run_id, "judgment", result, immutable=True)
         verify_source(self.store, self.manifest)
+        self.resolve_local_persistence()
         from .report import build_report
         report = build_report(self.store, self.run_id)
         review_name = 'assessment/completion-review'
@@ -410,7 +471,7 @@ class Workflow:
             technical = "MOCK: teste de infraestrutura; não é auditoria real"
         self.update(status=completion['status'], technical_result=technical, phase='done',
             limitations=[item['text'] for item in completion['limitations']],
-            completion_blockers=completion['blockers'], assessment_version=ASSESSMENT_VERSION)
+            completion_blockers=completion['blockers'], assessment_version=completion['version'])
 
     async def run(self, resume=False):
         with self.store.lock(self.run_id):
@@ -420,7 +481,20 @@ class Workflow:
                 if not investigation["valid"]:
                     raise PolicyError("Run encerrado com impedimento estrutural de investigação cega: "
                         + "; ".join(investigation["gaps"]))
+                saved = {r.value + '/' + p for r in Role for p in self.store.names(self.run_id, f'roles/{r.value}/phases')}
+                if set(state['completed']) != saved:
+                    await self.reconcile()
+                    state = self.state()
                 return state
+            await self.reconcile()
+            state = self.state()
+            if state.get('phase') == 'done':
+                return state
+            from .recovery import pending_attempts
+            unresolved = pending_attempts(self.store, self.manifest)
+            if unresolved:
+                self.update(status='blocked', recovery_pending=unresolved)
+                return self.state()
             self.store.put(self.run_id, 'financial-policy', {'permanent': True, 'rule': financial_policy()}, immutable=True)
             total_limit = total_seconds(self.store, self.run_id, self.config)
             if self.store.exists(self.run_id, "cancel"):
@@ -430,8 +504,13 @@ class Workflow:
                 self.store.event(self.run_id, "cancel_cleared_for_resume", {})
                 self.store.path(self.run_id, "cancel.json").unlink()
             if state.get("active_since"):
-                state["elapsed_seconds"] += max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(state["active_since"])).total_seconds())
-            self.update(status="running", active_since=now())
+                wall = max(0, (datetime.now(timezone.utc) - datetime.fromisoformat(state["active_since"])).total_seconds())
+                state["elapsed_seconds"] += wall
+                recovery = {'version': 'elapsed-recovery-1', 'active_since': state['active_since'],
+                    'observed_at': now(), 'charged_seconds': wall,
+                    'basis': 'conservative_wall_elapsed_including_unknown_downtime; not measured agent duration'}
+                self.store.put(self.run_id, 'clock-recoveries/' + object_hash(recovery), recovery, immutable=True)
+            self.update(status="running", elapsed_seconds=state['elapsed_seconds'], active_since=now())
             start = time.monotonic()
             remaining = total_limit - state.get("elapsed_seconds", 0)
             self._global_deadline = start + max(0, remaining)
@@ -451,7 +530,9 @@ class Workflow:
                 else:
                     await body
             except RuntimePaused as exc:
-                self.update(status="blocked", technical_result="inconclusivo", limitations=[str(exc)])
+                blocker = {'kind': 'local_persistence' if isinstance(exc, PersistencePending) else 'runtime_precondition',
+                           'invocation_id': getattr(exc, 'invocation_id', None), 'message': str(exc)}
+                self.update(status="blocked", technical_result="inconclusivo", limitations=[str(exc)], operational_blockers=[blocker])
             except BudgetExceeded as exc:
                 self.update(status="partial", technical_result="inconclusivo", limitations=[str(exc)])
             except asyncio.CancelledError:
@@ -460,7 +541,8 @@ class Workflow:
                 self.update(status="cancelled", technical_result="inconclusivo", limitations=["controlador interrompido"])
             except Exception as exc:
                 message = redact(str(exc))[:2000] if isinstance(exc, PolicyError) else "Falha do runtime: " + type(exc).__name__
-                self.update(status="partial" if isinstance(exc, (PolicyError, TimeoutError)) else "failed", technical_result="inconclusivo", limitations=[message])
+                self.update(status="partial" if isinstance(exc, (PolicyError, TimeoutError)) else "failed", technical_result="inconclusivo", limitations=[message],
+                    operational_blockers=[{'kind': 'unresolved_controller_error', 'message': message}])
             finally:
                 cancel.cancel()
                 await asyncio.gather(cancel, return_exceptions=True)

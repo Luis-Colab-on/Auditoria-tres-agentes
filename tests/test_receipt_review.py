@@ -135,6 +135,8 @@ def controller_run(smoke_run, monkeypatch, docker=None):
     monkeypatch.setattr('audit3.executor.process', docker)
     monkeypatch.setattr('audit3.executor.shutil.which', lambda name: '/mock/docker' if name == 'docker' else None)
     async def handler(role, phase, payload, tools, final):
+        from helpers import read_phase_context
+        read_phase_context(payload, tools)
         if final:
             for eid in payload['baseline_receipts']:
                 tools.read_evidence(eid)

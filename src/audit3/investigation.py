@@ -63,7 +63,7 @@ def validate_saved_initial(store, manifest, config, role, phase, assignment=None
             raise PolicyError('fase cega diverge do parecer congelado na barreira')
     tools = SourceTools(store, manifest, config, None,
         ToolContext(manifest.run_id, role, phase, record.get('invocation_id', 'historical-assessment')),
-        read_before=record['published_at'])
+        read_before=record.get('evidence_cutoff', record['published_at']))
     output = Opinion.model_validate(record['output'])
     validate_initial_output(output, tools, assignment)
     return output

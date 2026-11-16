@@ -468,6 +468,7 @@ def test_turn_request_sends_strict_opinion_and_judgment_schemas(make_run, final)
 @pytest.mark.parametrize('role,phase', [('auditor','initial-0000'),('defensor','initial-0000'),('juiz','blind'),('juiz','final')])
 def test_every_turn_receives_actual_verified_financial_facts_without_secrets(make_run, role, phase):
     store, m, runtime, rpc, tools = rig(make_run)
+    tools = SourceTools(store,m,runtime.config,tools.executor,ToolContext(m.run_id,role,phase,tools.context.invocation_id))
     rpc.account['planType'] = 'prolite'
     confirmation = {**proof(), 'account_fingerprint': account_identity(rpc.account)}
     store.put(m.run_id, 'financial-confirmation', confirmation)
@@ -503,6 +504,7 @@ def test_failed_financial_preflight_never_delivers_a_verified_context_or_starts_
 
 def test_turn_deadline_reports_role_operation_and_preserves_limit(make_run):
     store,m,runtime,rpc,tools=rig(make_run)
+    tools = SourceTools(store,m,runtime.config,tools.executor,ToolContext(m.run_id,'defensor','initial-0000',tools.context.invocation_id))
     runtime.config.limits.call_timeout=1
     rpc.mode='timeout'
     with pytest.raises(RuntimePaused,match='defensor/initial-0000: turn_deadline; aguardando event_stream'):
@@ -515,7 +517,7 @@ def test_turn_deadline_reports_role_operation_and_preserves_limit(make_run):
     assert rpc.closed and sum(method=='turn/interrupt' for method,_ in rpc.calls)==1
 
 
-def test_rpc_timeout_inside_turn_is_distinguished_from_turn_deadline(make_run):
+def test_received_quota_rpc_timeout_stops_before_dispatch(make_run):
     store,m,runtime,rpc,tools=rig(make_run)
     original=rpc.request
     reads=0
@@ -528,10 +530,13 @@ def test_rpc_timeout_inside_turn_is_distinguished_from_turn_deadline(make_run):
     rpc.request=request
     rpc.events.put_nowait({'method':'account/rateLimits/updated','params':{}})
     with pytest.raises(RuntimePaused,match='rpc_timeout; aguardando rpc:account/rateLimits/read'):
-        asyncio.run(runtime.invoke('defensor','initial-0000',{},tools))
-    saved=store.get(m.run_id,'codex-turns/'+tools.context.invocation_id)
-    assert saved['timeout']['origin']=='rpc_timeout'
-    assert saved['timeout']['turn_limit_seconds']==120 and saved['timeout']['rpc_limit_seconds']==20
+        asyncio.run(runtime.invoke('auditor','initial-0000',{},tools))
+    assert not store.exists(m.run_id,'codex-turns/'+tools.context.invocation_id)
+    assert not any(method=='turn/start' for method,_ in rpc.calls)
+    assert store.get(m.run_id,'ledger')['calls']==[]
+    events=[store.get(m.run_id,'events/'+name) for name in store.names(m.run_id,'events')]
+    diagnostic=next(e['data'] for e in events if e['kind']=='pre_dispatch_timeout')
+    assert diagnostic['dispatch_status']=='not_sent' and diagnostic['operation']=='rpc:account/rateLimits/read'
 
 
 def test_explicit_interruption_recovery_uses_existing_slot_and_reuses_auditor(make_run):

@@ -20,12 +20,19 @@ Arquivos excluídos/runtime e relatórios em quarentena mantêm as restrições 
 um ponteiro de inventário não concede acesso a conteúdo bloqueado. Relatórios prévios
 não aparecem no catálogo nem na paginação antes da publicação da barreira.
 
-O primeiro turno recebe o catálogo. O runtime só omite sua repetição se encontrar
+O primeiro turno recebe o catálogo quando a requisição serializada cabe no teto.
+Caso contrário, `catalog_delivery.mode=paged_first_delivery` indica descoberta por
+`list_source`, sem presumir uma entrega anterior. O runtime também omite repetição se encontrar
 checkpoint autenticado **concluído**, do mesmo papel, sessão, manifesto, versão e
 inventário, que tenha incluído aquele catálogo. Reserva, envio, turno ambíguo ou
 `not_sent` não demonstram entrega. O objetivo e as restrições permanecem em cada
 entrada. O checkpoint registra separadamente o hash lógico, o hash efetivo, a origem
 da entrega e os bytes UTF-8 efetivos. A entrada original não é modificada pelo runtime.
+
+Pareceres completos do debate e receipts extensos podem usar páginas verificáveis;
+consulte [planejamento e recuperação](planejamento-retomada.md). A entrada lógica,
+o texto efetivo e o frame RPC possuem medições separadas. O frame, incluindo schema
+e escape do texto, passa pelo teto antes da escrita.
 
 O controlador não injeta histórico substituto em `thread/resume`, não apaga mensagens,
 não cria novas sessões para evitar compactação e não sintetiza análises anteriores.

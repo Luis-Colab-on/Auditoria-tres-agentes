@@ -2,6 +2,11 @@
 from .security import object_hash, PolicyError
 
 VERSION = 'scoped-assessment-5'
+CURRENT_VERSION = 'scoped-assessment-6'
+
+
+def version_for(report):
+    return CURRENT_VERSION if report.get('schema_version') == '2.0' else VERSION
 
 
 def pointer(document, path):
@@ -20,6 +25,8 @@ def context_hash(report):
         'state', 'receipts', 'usage', 'runtime', 'structural_checks', 'findings', 'verdicts', 'comparisons')}
     if 'batch_distribution' in report:
         context['batch_distribution'] = report['batch_distribution']
+    if report.get('schema_version') == '2.0':
+        context.update({k: report.get(k) for k in ('schema_version', 'planning', 'phase_progress', 'operational_history')})
     return object_hash(context)
 
 
@@ -56,7 +63,7 @@ def required_phases(report):
 
 
 def protocol_phases(manifest, config, additional_round=False, *, initial_batches=None):
-    from .workflow import batches
+    from .turn_planning import batches
     required = {f'{role}/{phase}' for role in ('auditor', 'defensor') for phase in ('contest', 'reply')}
     required |= {f'{role}/initial-{index:04d}' for role in ('auditor', 'defensor')
                  for index, _ in enumerate(initial_batches if initial_batches is not None else batches(manifest, config.limits.batch_lines))}
@@ -72,7 +79,7 @@ def assess_completion(report, review=None, required=None):
     if review.get('draft') is True:
         from .explicit_review import seal_review
         review = seal_review(review)
-    if review and (review.get('version') != VERSION or review.get('context_hash') != context_hash(report)
+    if review and (review.get('version') != version_for(report) or review.get('context_hash') != context_hash(report)
                    or review.get('objective') != report['manifest']['requirements']):
         raise PolicyError('Revisão de limitações não corresponde ao objetivo/evidências')
     if review and review.get('id') != object_hash({k: v for k, v in review.items() if k != 'id'}):
@@ -135,7 +142,7 @@ def assess_completion(report, review=None, required=None):
         entries.append(entry)
         if entry['kind'] in {'blocking', 'unresolved'}:
             blockers.append({'kind': entry['kind'], 'message_hash': key, 'text': message['text']})
-    return {'version': VERSION, 'objective': report['manifest']['requirements'],
+    return {'version': version_for(report), 'objective': report['manifest']['requirements'],
             'context_hash': context_hash(report), 'review_id': review.get('id'),
             'review_status': 'applied' if review else 'pending', 'status': 'partial' if blockers else 'completed',
             'blockers': blockers, 'limitations': entries,

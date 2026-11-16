@@ -64,7 +64,7 @@ def coverage(store: Store, manifest: RunManifest):
             if not (name == "blind" if role == "juiz" else name.startswith("initial-")):
                 continue
             record = store.get(manifest.run_id, f"roles/{role}/phases/{name}")
-            tools.read_before = record.get("published_at")
+            tools.read_before = record.get('evidence_cutoff', record.get("published_at"))
             if not tools.read_before:
                 continue
             from .schemas import InspectionRecord
@@ -124,7 +124,7 @@ def intervals(values):
 def structural_checks(store, manifest, state, judgment):
     """Re-evaluate immutable evidence without rewriting historical records."""
     from .snapshot import verify_source
-    from .workflow import Workflow
+    from .phase_validation import PhaseValidator
     from .schemas import Judgment
     from .operational import total_seconds
     result = {'evidence_context_hash': object_hash({
@@ -146,11 +146,13 @@ def structural_checks(store, manifest, state, judgment):
         if not judgment:
             raise PolicyError('Julgamento final ausente')
         record = store.get(manifest.run_id, 'roles/juiz/phases/final')
+        PhaseValidator(store, manifest, config, read_only=True).validate_record(record, 'juiz', 'final')
         if record['output'] != judgment:
             raise PolicyError('Julgamento diverge da fase final persistida')
         tools = SourceTools(store, manifest, config, None,
-            ToolContext(manifest.run_id, 'juiz', 'final', 'report-validation'))
-        Workflow(store, manifest.run_id, runtime=object()).validate_output(
+            ToolContext(manifest.run_id, 'juiz', 'final', record.get('invocation_id', 'report-validation')),
+            read_before=record.get('evidence_cutoff', record['published_at']))
+        PhaseValidator(store, manifest, config, read_only=True).validate_output(
             Judgment.model_validate(judgment), tools, final=True)
     check('final_validation', final)
     def limits():
@@ -226,6 +228,19 @@ def build_report(store: Store, run_id: str, *, use_review=True):
     if batch_distribution:
         report['batch_distribution'] = batch_distribution
     report['structural_checks'] = structural_checks(store, manifest, state, judgment)
+    if store.exists(run_id, 'planning/initial') or store.names(run_id, 'turn-inputs'):
+        from .turn_planning import global_plan
+        from .completion import version_for
+        report['schema_version'] = '2.0'
+        report['planning'] = global_plan(store, manifest, config)
+        published_phases = {r + '/' + p['phase'] for r, rows in opinions.items() for p in rows}
+        report['phase_progress'] = {'published': sorted(published_phases), 'indexed': state['completed'],
+            'missing_from_index': sorted(published_phases - set(state['completed'])),
+            'unpublished': sorted(set(report['required_phases']) - published_phases)}
+        report['causal_validation']['version'] = version_for(report)
+        report['decision_delivery'] = decision_delivery(store, manifest, config, report['findings'], report['verdicts'])
+        report['operational_history'] = [store.get(run_id, 'reconciliations/' + identity)
+                                         for identity in state.get('reconciliation_records', [])]
     review = store.get(run_id, review_name) if use_review and store.exists(run_id, review_name) else None
     report['completion_review'] = review
     try:
@@ -248,6 +263,37 @@ def build_report(store: Store, run_id: str, *, use_review=True):
     return report
 
 
+def decision_delivery(store, manifest, config, findings, verdicts):
+    """Actionable rendering of grounded judgments; absence stays explicit."""
+    tools = SourceTools(store, manifest, config, None, ToolContext(manifest.run_id, 'juiz', 'final', 'report-excerpts'))
+    by_id = {v['finding_id']: v for v in verdicts}
+    rows = []
+    for finding in findings:
+        verdict = by_id.get(finding['id'], {})
+        delivery = verdict.get('delivery') or {}
+        locations = []
+        for ref in finding['refs']:
+            entry = dict(ref)
+            try:
+                lines = tools.source_bytes_for_validation(ref['path']).decode().splitlines()
+                entry['excerpt'] = '\n'.join(lines[ref['start'] - 1:min(ref['end'], ref['start'] + 19)])
+                entry['excerpt_truncated'] = ref['end'] - ref['start'] >= 20
+            except (PolicyError, OSError, UnicodeError) as exc:
+                entry['excerpt'] = None
+                entry['unavailable_reason'] = type(exc).__name__
+            locations.append(entry)
+        rows.append({'finding_id': finding['id'], 'classification': verdict.get('classification'),
+            'decision': verdict.get('decision'), 'rationale': verdict.get('rationale'),
+            'priority': delivery.get('priority'), 'priority_rationale': delivery.get('priority_rationale'),
+            'priority_origin': 'judge_assessment' if delivery else 'not_recorded',
+            'locations': locations, 'scenario': {'trigger': finding['trigger'], 'conditions': finding['necessary_conditions'],
+                'expected': finding['expected'], 'observed': finding['observed']},
+            'evidence_ids': sorted(set(finding['evidence_ids'] + verdict.get('evidence_ids', []))),
+            'proposed_adjustment': delivery.get('proposed_adjustment'), 'preserve_behavior': delivery.get('preserve_behavior'),
+            'regression_test': delivery.get('regression_test'), 'pending_verification': delivery.get('pending_verification')})
+    return rows
+
+
 def sum_known(receipts, key):
     return sum(r[key] for r in receipts) if receipts and all(r[key] is not None for r in receipts) else None
 
@@ -262,10 +308,20 @@ def markdown(report):
         "Revisão: " + str(completion.get('review_id') or completion['review_status']),
         "Aceitação do smoke: " + report.get('acceptance', {}).get('status', 'not_evaluated'), "",
         "Pendências/bloqueios: " + json.dumps(completion['blockers'], ensure_ascii=False), ""]
+    if report.get('operational_history'):
+        lines += ['Histórico operacional preservado e reconciliado: ' + json.dumps(report['operational_history'], ensure_ascii=False), '']
     for verdict in report["verdicts"]:
         lines.append(f"| {verdict['finding_id']} | {verdict['classification']} | {verdict['decision']} |")
     if not report["verdicts"]:
         lines.append("| — | Sem decisão sobre defeitos | Veja cobertura e estado operacional |")
+    for row in report.get('decision_delivery', []):
+        lines += ['', '### Entrega: ' + row['finding_id'],
+            'Prioridade: ' + str(row['priority']) + ' — ' + str(row['priority_rationale']),
+            'Ajuste proposto: ' + str(row['proposed_adjustment']),
+            'Preservar: ' + str(row['preserve_behavior']), 'Regressão: ' + str(row['regression_test']),
+            'Verificação pendente: ' + json.dumps(row['pending_verification'], ensure_ascii=False)]
+        for ref in row['locations']:
+            lines += [f"Fonte: `{ref['path']}:{ref['start']}–{ref['end']}` ({ref['sha256']})", '```', ref.get('excerpt') or '(trecho indisponível)', '```']
     for finding in report["findings"]:
         lines += ["", "### " + finding["id"] + ": " + finding["title"], "", "Invariante: " + finding["invariant"], "", "Gatilho: " + finding["trigger"], "", "Condições: " + "; ".join(finding["necessary_conditions"]), "", "Fluxo: " + finding["complete_flow"], "", "Proteções consideradas: " + "; ".join(finding["protections_considered"]), "", "Esperado: " + finding["expected"], "", "Observado: " + finding["observed"], "", "Ambiente real: " + finding["real_environment_relevance"], "", "Origem: " + finding["origin"]]
         for v in report["verdicts"]:

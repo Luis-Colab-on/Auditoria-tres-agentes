@@ -268,9 +268,11 @@ def prepare(store: Store, repo: str, ref: str | None, profile: Profile, config: 
         tree_state=state, submodules=submodules, files=records, lfs=[f.path for f in records if f.reason == "lfs_pointer_not_materialized"],
         config_hash=object_hash(config), profile_hash=object_hash(profile), requirements=requirements, acquisition_review_hash=review_hash,
         prompt_hashes={name: digest(files("audit3").joinpath("prompts", name + ".txt").read_bytes()) for name in [*(r.value for r in Role), "common"]},
-        estimated_input_tokens=sum(f.size for f in owned) // 3 * 3 + 12000,
-        estimated_calls=3 + 2 * math.ceil(sum(max(1, f.lines) for f in owned) / config.limits.batch_lines) + 7,
+        estimated_input_tokens=None,
+        estimated_calls=0,
         limitations=["Scanner de segredos/PII é heurístico: revisar inventário antes do run; omissões reduzem cobertura.", "Nenhuma ocorrência em produção fornecida."])
+    from .completion import protocol_phases
+    manifest.estimated_calls = len(protocol_phases(manifest, config))
     if source_review:
         store.put(run_id, 'acquisition/source-review', source_review, immutable=True)
     store.put(run_id, "manifest", manifest, immutable=True)
@@ -278,6 +280,8 @@ def prepare(store: Store, repo: str, ref: str | None, profile: Profile, config: 
     store.put(run_id, "profile", profile, immutable=True)
     store.put(run_id, "state", {"status": "prepared", "technical_result": "not_evaluated", "phase": "prepared", "completed": [], "limitations": [], "elapsed_seconds": 0.0})
     store.put(run_id, "ledger", {"calls": [], "tokens": None, "known_cost_usd": None, "unknown_cost_calls": 0})
+    from .turn_planning import global_plan
+    store.put(run_id, 'planning/initial', global_plan(store, manifest, config, check_tools=True), immutable=True)
     for location in ("source", "prior"):
         root = store.path(run_id, location)
         root.mkdir(exist_ok=True, parents=True)

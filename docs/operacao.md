@@ -110,6 +110,11 @@ Sem comparação, use origem desconhecida. O comando não aplica patches.
 
 ## Limites e retomada no Codex
 
+O [procedimento de planejamento e recuperação durável](planejamento-retomada.md)
+documenta `plan`, `recover`, paginação de contexto e reconciliação sem inferência.
+`resume` primeiro reaproveita trabalho durável válido; preflight e fatos financeiros
+atuais são necessários antes de um novo despacho, não para reconciliação local.
+
 Veja [Codex Pro](codex-pro.md) para os valores efetivos: `max_calls` conta turnos
 App Server; `max_turns` limita passos de ferramenta por turno. Não se usa orçamento
 em dólares ou tarifa API. A execução é serial no transporte, mesmo que o controlador

@@ -120,6 +120,11 @@ class SourceTools:
         self.check()
         if not re.fullmatch(r"[a-f0-9]{24}", evidence_id):
             raise PolicyError("ID de evidência inválido")
+        if self.store.exists(self.context.run_id, 'context-pages/' + evidence_id):
+            if not record_access:
+                raise PolicyError('Página de contexto não é receipt de execução')
+            from .context_pages import read_page
+            return read_page(self, evidence_id)
         if self.store.exists(self.context.run_id, "comparisons/" + evidence_id):
             from .comparison import read_comparison
             result = read_comparison(self.store, self.context.run_id, evidence_id)
@@ -133,15 +138,32 @@ class SourceTools:
             raise PolicyError("evidência privada antes da barreira")
         if receipt.run_id != self.context.run_id or receipt.source_id != self.manifest.source_id:
             raise PolicyError("receipt de outra versão")
+        result = {"receipt": receipt.model_dump(), "test": self.store.get(self.context.run_id, "tests/" + evidence_id)}
         if record_access:
+            from .security import canonical
+            if len(canonical(result)) > self.config.limits.max_output_bytes - 2048:
+                from .context_pages import create_reference, read_page
+                ref = create_reference(self.store, self.manifest, self.config, result,
+                    phase=self.context.phase, audience=[self.context.role], kind='receipt', receipt_id=evidence_id)
+                return {**read_page(self, ref['page_ids'][0]), 'receipt_reference': ref}
             self.log("read_evidence", {"id": evidence_id})
-        return {"receipt": receipt.model_dump(), "test": self.store.get(self.context.run_id, "tests/" + evidence_id)}
+        return result
+
+    def require_phase_context(self):
+        name = 'turn-inputs/' + self.context.invocation_id
+        if self.store.exists(self.context.run_id, name):
+            record = self.store.get(self.context.run_id, name)
+            ids = record['payload'].get('required_context_pages', [])
+            from .context_pages import pages_consulted
+            if not pages_consulted(self, ids):
+                raise PolicyError('Argumentos completos da fase não consultados nas páginas obrigatórias')
 
     def require_evidence_consulted(self, evidence_id: str):
         for name in self.store.names(self.context.run_id, "events"):
             event = self.store.get(self.context.run_id, "events/" + name)
             data = event["data"]
-            if event["kind"] == "tool" and data.get("role") == self.context.role and data.get("tool") in {"read_evidence", "submit_test", "read_comparison"} and data.get("id") == evidence_id:
+            if (event["kind"] == "tool" and data.get("role") == self.context.role and data.get("tool") in {"read_evidence", "submit_test", "read_comparison"}
+                and data.get("id") == evidence_id and (not self.read_before or event['at'] <= self.read_before)):
                 return
         raise PolicyError("evidência não consultada diretamente pelo papel")
 

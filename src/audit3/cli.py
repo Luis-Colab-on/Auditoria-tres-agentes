@@ -83,6 +83,17 @@ def main(argv=None):
     p.add_argument('--source-review', type=Path, help='revisão explícita de sinais do scanner, fora da fonte auditada')
     r = sub.add_parser("run")
     r.add_argument("--prepared", required=True)
+    plan = sub.add_parser('plan', help='planejamento global/leitura, sem inferência')
+    plan.add_argument('id')
+    plan.add_argument('--redistribute', action='store_true')
+    plan.add_argument('--reviewer')
+    plan.add_argument('--apply', action='store_true')
+    plan.add_argument('--output', type=Path)
+    recovery = sub.add_parser('recover', help='reconciliar persistência sem inferência; consulta oficial é explícita')
+    recovery.add_argument('id')
+    recovery.add_argument('--invocation')
+    recovery.add_argument('--check-official', action='store_true')
+    recovery.add_argument('--allow-next-attempt', action='store_true', help='usar somente um próximo slot já existente, com prova; não despacha')
     comparison = sub.add_parser("compare", help="registrar comparação factual antes/depois")
     comparison.add_argument("--before", required=True)
     comparison.add_argument("--after", required=True)
@@ -108,7 +119,7 @@ def main(argv=None):
                 result["official_metadata"] = asyncio.run(probe_codex(args.store))
             emit(result)
             return 0
-        if args.command in {'review-completion', 'export'}:
+        if args.command in {'review-completion', 'export', 'status', 'report'} or (args.command == 'plan' and not args.apply):
             from .reprocess import ReadOnlyStore
             store = ReadOnlyStore(args.store)
         else:
@@ -123,8 +134,14 @@ def main(argv=None):
             from .codex_policy import financial_remaining
             store.get(args.id, "manifest")
             remaining = financial_remaining(args.checked_at)
-            store.put(args.id, "financial-confirmation", {"source": "operator_factual_confirmation", "checked_at": args.checked_at,
-                "account_fingerprint": args.account_fingerprint, "auto_recharge": args.auto_recharge, "extra_credits": args.extra_credits})
+            from .security import object_hash
+            if store.exists(args.id, 'financial-confirmation'):
+                previous = store.get(args.id, 'financial-confirmation')
+                store.put(args.id, 'financial-confirmations/' + object_hash(previous), previous, immutable=True)
+            proof = {"source": "operator_factual_confirmation", "checked_at": args.checked_at,
+                "account_fingerprint": args.account_fingerprint, "auto_recharge": args.auto_recharge, "extra_credits": args.extra_credits}
+            store.put(args.id, 'financial-confirmations/' + object_hash(proof), proof, immutable=True)
+            store.put(args.id, "financial-confirmation", proof)
             emit({"recorded": "operator facts; checked again against official account/quota before generation", "checked_at": args.checked_at, "remaining_valid_seconds": remaining})
             return 0
         if args.command == "compare":
@@ -136,14 +153,49 @@ def main(argv=None):
             m = prepare(store, args.repo, args.ref, load_profile(args.profile), load_config(args.config), args.requirements.read_text() if args.requirements else "",
                 directory=args.directory, source_review=json.loads(args.source_review.read_text()) if args.source_review else None)
             emit({"prepared": m.run_id, "source_id": m.source_id, "inventory_files": len(m.files), "estimated_input_tokens": m.estimated_input_tokens,
-                "estimated_runner_calls": m.estimated_calls, "model_turns": 0, "next": "Revise inventário/omissões e execute audit3 run --prepared ID. O código consultado será processado remotamente pela OpenAI via Codex."})
-            return 0
+                "estimated_runner_calls": m.estimated_calls, "planning": store.get(m.run_id, 'planning/initial'),
+                "model_turns": 0, "next": "Revise inventário/omissões e plan antes de run. O código consultado será processado remotamente pela OpenAI via Codex."})
+            return 0 if store.get(m.run_id, 'planning/initial')['viable'] else 2
         run_id = args.prepared if args.command == "run" else args.id
         if args.command in {"run", "resume"}:
             from .workflow import Workflow
             state = asyncio.run(Workflow(store, run_id).run(resume=args.command == "resume"))
             emit(state)
             return 0 if state["status"] == "completed" else 2
+        if args.command == 'recover':
+            from .workflow import Workflow
+            from .recovery import recover
+            if (args.check_official or args.allow_next_attempt) and not args.invocation:
+                raise PolicyError('Recuperação específica exige --invocation')
+            result = asyncio.run(recover(Workflow(store, run_id), args.invocation,
+                check_official=args.check_official, allow_next=args.allow_next_attempt))
+            emit(result)
+            return 0 if result['decision'] or not result['pending'] else 2
+        if args.command == 'plan':
+            from .schemas import RunManifest
+            from .config import Config
+            from .turn_planning import global_plan
+            m = RunManifest.model_validate(store.get(run_id, 'manifest'))
+            cfg = Config.model_validate(store.get(run_id, 'config'))
+            if args.redistribute:
+                if not args.reviewer or not args.output:
+                    raise PolicyError('Redistribuição exige --reviewer e --output separados do Store')
+                if args.output.resolve().is_relative_to(store.root):
+                    raise PolicyError('Candidato deve ficar fora do Store')
+                from .batch_distribution import build_distribution, register_distribution
+                record = build_distribution(store, m, cfg, args.reviewer)
+                with args.output.open('x') as destination:
+                    json.dump(record, destination, ensure_ascii=False, indent=2)
+                result = global_plan(store, m, cfg, initial_batches=record['batches'])
+                if args.apply:
+                    register_distribution(store, m, cfg, record)
+                    result = global_plan(store, m, cfg, check_tools=True)
+            else:
+                if args.apply:
+                    raise PolicyError('--apply exige --redistribute')
+                result = global_plan(store, m, cfg, check_tools=True)
+            emit(result)
+            return 0 if result['viable'] else 2
         if args.command == 'review-completion':
             from .report import build_report
             from .scope_review import review_report
@@ -174,14 +226,18 @@ def main(argv=None):
             emit(result)
             return 0 if args.template or result['completion_assessment']['status'] == 'completed' else 2
         if args.command == "status":
-            emit({"state": store.get(run_id, "state"), "usage": store.get(run_id, "ledger"), "cancel_requested": store.exists(run_id, "cancel")})
+            from .turn_planning import global_plan
+            from .schemas import RunManifest
+            from .config import Config
+            emit({"state": store.get(run_id, "state"), "usage": store.get(run_id, "ledger"), "cancel_requested": store.exists(run_id, "cancel"),
+                  'planning': global_plan(store, RunManifest.model_validate(store.get(run_id,'manifest')), Config.model_validate(store.get(run_id,'config')))})
         elif args.command == "cancel":
             store.get(run_id, "state")
             store.put(run_id, "cancel", {"requested_at": now()})
             emit({"run_id": run_id, "cancel_requested": True})
         elif args.command == "report":
-            from .report import markdown, write_report
-            print(markdown(write_report(store, run_id)))
+            from .report import markdown, build_report
+            print(markdown(build_report(store, run_id)))
         elif args.command == "export":
             from .report import export_zip
             path = export_zip(store, run_id, args.output or Path("audit3-" + run_id + ".zip"), args.evidence)

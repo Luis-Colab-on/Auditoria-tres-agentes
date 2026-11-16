@@ -73,8 +73,8 @@ def validate_annotation(report, message, annotation, review=None):
 
 
 def make_review(report):
-    from .completion import VERSION, context_hash, limitation_messages
-    review = {'version': VERSION, 'policy': POLICY, 'context_hash': context_hash(report),
+    from .completion import version_for, context_hash, limitation_messages
+    review = {'version': version_for(report), 'policy': POLICY, 'context_hash': context_hash(report),
               'objective': report['manifest']['requirements'], 'messages': {}}
     for key, message in limitation_messages(report).items():
         for criterion, (text, kind, justification) in NOTES.items():

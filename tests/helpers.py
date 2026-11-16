@@ -1,4 +1,5 @@
-from audit3.schemas import InspectionRecord, Judgment, Opinion, SourceRef
+import json
+from audit3.schemas import InspectionRecord, Judgment, Opinion, SourceRef, AgentPosition
 
 
 class MockRuntime:
@@ -15,6 +16,7 @@ class MockRuntime:
             special = await self.handler(role, phase, payload, tools, final)
             if special is not None:
                 return special
+        discussion = read_phase_context(payload, tools)
         records = []
         for f in tools.manifest.files:
             if f.category in {"excluded", "prior_report"} or f.lines == 0:
@@ -30,7 +32,18 @@ class MockRuntime:
                 cursor = end + 1
         if final:
             return Judgment(summary="MOCK: no findings", verdicts=[], new_findings=[], limitations=[])
-        return Opinion(summary="MOCK infrastructure exercise", inspections=records, findings=[], positions=[], limitations=[])
+        positions = [AgentPosition(finding_id=fid, classification='hipótese não confirmada', decision='investigar',
+            argument='MOCK: posição sintética explícita sobre o argumento fornecido; não é validação semântica real',
+            evidence_ids=[], changed_position=False) for fid in discussion.get('finding_ids', [])]
+        return Opinion(summary="MOCK infrastructure exercise", inspections=records, findings=[], positions=positions, limitations=[])
+
+
+def read_phase_context(payload, tools):
+    """Explicit synthetic consumption of paged input, separate from source proof."""
+    text = []
+    for page in payload.get('required_context_pages', []):
+        text.append(tools.read_evidence(page)['context_page']['text'])
+    return json.loads(''.join(text)) if text else {}
 
 
 def initial_investigation(store, manifest, role):

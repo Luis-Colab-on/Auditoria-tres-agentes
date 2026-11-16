@@ -32,6 +32,14 @@ integrações Docker/live não executadas nessa rodada**. Essas alterações ain
 passaram por nova execução real completa dos três agentes. Consulte os procedimentos
 de [aquisição local](docs/aquisicao-local.md) e [contexto dos agentes](docs/contexto-dos-agentes.md).
 
+A reestruturação de planejamento, contexto paginado e recuperação durável está
+documentada em [planejamento e retomada](docs/planejamento-retomada.md). Essa revisão
+mantém os três papéis e o escopo completo; sua validação local não substitui uma
+nova execução real. Resultados históricos acima permanecem referências anteriores.
+Nesta rodada, **855 testes offline e sete integrações Docker sintéticas passaram,
+sem falhas**. O pacote instalado fora do checkout passou em 13 verificações; o
+smoke dos agentes reais não foi executado. Nenhuma conferência financeira foi renovada.
+
 Consulte o **[guia de uso da versão validada](docs/uso-versao-validada.md)** para
 preparação local, delimitação de escopo, comandos exatos, conferência financeira,
 início, acompanhamento, retomada, limites, resultados e limitações. Os

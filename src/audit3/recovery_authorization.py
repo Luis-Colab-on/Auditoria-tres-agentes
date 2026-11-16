@@ -103,3 +103,37 @@ def chained_attempt_count(store, manifest, config, role, phase, attempt_count, p
     # Exactly one further fixed slot. No recursive chain, cap increase, slot
     # refund, reservation deletion, or automatic exception for another phase.
     return attempt_count + 1
+
+
+def attempt_limit(store, manifest, config, role, phase):
+    name = f"roles/{role}/phases/{phase}"
+    attempt_count = config.limits.invalid_output_retries + 1
+    authorization_name = name.replace('/phases/', '/attempts/') + '-extra-authorization'
+    if store.exists(manifest.run_id, authorization_name):
+        authorization = store.get(manifest.run_id, authorization_name)
+        expected = {'source': 'explicit_operator_authorization', 'run_id': manifest.run_id,
+            'role': role, 'phase': phase, 'additional_attempts': 1,
+            'attempt_slot': attempt_count, 'config_hash': manifest.config_hash}
+        previous_name = name.replace('/phases/', '/attempts/') + f'-{attempt_count - 1}'
+        if (any(authorization.get(key) != value for key, value in expected.items())
+            or not all(store.exists(manifest.run_id, name.replace('/phases/', '/attempts/') + f'-{i}') for i in range(attempt_count))
+            or authorization.get('previous_invocation_id') != store.get(manifest.run_id, previous_name)['invocation_id']
+            or not store.exists(manifest.run_id, previous_name + '-interrupted')):
+            raise RuntimePaused('Exceção de tentativa adicional inválida; retomada bloqueada')
+        if 'prior_attempts' in authorization:
+            prior_attempts = authorization['prior_attempts']
+            if not isinstance(prior_attempts, list) or len(prior_attempts) != attempt_count:
+                raise RuntimePaused('Vinculação das tentativas anteriores inválida')
+            for slot, prior in enumerate(prior_attempts):
+                old_name = name.replace('/phases/', '/attempts/') + f'-{slot}'
+                old = store.get(manifest.run_id, old_name)
+                old_turn = store.get(manifest.run_id, 'codex-turns/' + old['invocation_id'])
+                if prior != {'slot': slot, 'invocation_id': old['invocation_id'],
+                             'attempt_hash': object_hash(old), 'checkpoint_hash': object_hash(old_turn)}:
+                    raise RuntimePaused('Vinculação das tentativas anteriores inválida')
+        # One immutable authorization permits one fixed slot for this
+        # role/phase only. Its checkpoint prevents replay after failure.
+        attempt_count += 1
+    attempt_count = chained_attempt_count(store, manifest, config,
+        role, phase, attempt_count, authorization_name)
+    return attempt_count

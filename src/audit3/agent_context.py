@@ -48,7 +48,7 @@ def agent_manifest(store, manifest, published):
     return view
 
 
-def prepare_turn_context(store, manifest, payload, role, thread_id, published):
+def prepare_turn_context(store, manifest, payload, role, thread_id, published, *, omit_catalog=False):
     """Suppress a repeated catalog only after a same-session completed delivery.
 
     Ambiguous/written/not_sent turns never prove delivery. No history is replaced,
@@ -74,13 +74,15 @@ def prepare_turn_context(store, manifest, payload, role, thread_id, published):
             prior_id = name
             break
     sent_view = dict(view)
-    if prior_id:
+    if prior_id or omit_catalog:
         sent_view.pop('files')
-    sent_view['catalog_delivery'] = {'included': prior_id is None, 'previous_completed_invocation_id': prior_id,
+    included = prior_id is None and not omit_catalog
+    sent_view['catalog_delivery'] = {'included': included, 'previous_completed_invocation_id': prior_id,
+        'mode': 'inline' if included else ('previous_delivery' if prior_id else 'paged_first_delivery'),
         'instruction': 'Se o catálogo não estiver no contexto atual, consulte list_source; '
                        'o controlador não apaga o histórico nem presume que a compactação preservou informação.'}
     metadata = {'version': VERSION, 'catalog_id': view['catalog_id'],
                 'manifest_sha256': view['manifest_ref']['sha256'],
                 'inventory_sha256': view['inventory']['inventory_sha256'],
-                'catalog_included': prior_id is None, 'catalog_origin_invocation_id': prior_id}
+                'catalog_included': included, 'catalog_origin_invocation_id': prior_id}
     return {**payload, 'manifest': sent_view}, metadata

@@ -46,6 +46,8 @@ def history(store, m):
 def assigned_runtime():
     """Opt-in positive mock: only its assigned work, not whole-source auto coverage."""
     async def handler(role, phase, payload, tools, final):
+        from helpers import read_phase_context
+        read_phase_context(payload, tools)
         if final:
             return Judgment(summary='MOCK phase completion', verdicts=[], new_findings=[], limitations=[])
         records = []

@@ -20,6 +20,8 @@ def historical_mock(smoke_run):
     executor = SyntheticExecutor(store, manifest)
     asyncio.run(prepare_smoke_evidence(store, manifest, config, executor))
     async def handler(role, phase, payload, tools, final):
+        from helpers import read_phase_context
+        read_phase_context(payload, tools)
         if final:
             for eid in payload['baseline_receipts']:
                 tools.read_evidence(eid)

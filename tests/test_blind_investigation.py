@@ -149,7 +149,7 @@ def test_blank_analysis_is_not_inspection(make_run):
 
 
 def test_late_coverage_and_scope_review_cannot_remove_structural_gap(make_run, monkeypatch):
-    from audit3.completion import assess_completion, context_hash, limitation_messages, VERSION
+    from audit3.completion import assess_completion, context_hash, limitation_messages, version_for
     from audit3.security import object_hash
     monkeypatch.setattr('audit3.executor.shutil.which', lambda _: None)
     store, m = make_run({'app.py': 'x = 1\n'})
@@ -163,7 +163,7 @@ def test_late_coverage_and_scope_review_cannot_remove_structural_gap(make_run, m
     before = store.path(m.run_id, name + '.json').read_bytes()
     report = build_report(store, m.run_id)
     assert not report['coverage']['independent_investigation']['valid']
-    review = {'version': VERSION, 'objective': m.requirements, 'context_hash': context_hash(report),
+    review = {'version': version_for(report), 'objective': m.requirements, 'context_hash': context_hash(report),
               'messages': {key: {'kind': 'scope_note', 'justification': 'Synthetic review cannot remove missing blind source evidence',
                 'evidence': ['/manifest/requirements']} for key in limitation_messages(report)}}
     review['id'] = object_hash(review)
