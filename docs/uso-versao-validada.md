@@ -3,11 +3,18 @@
 Referência atual encerrada em 12/11/2026: run **`e7a349ffa7b7bcdf47de1ab4`**, cenário
 sintético pequeno PHP/WordPress. Esta página consolida a operação implementada e
 o alcance demonstrado. Não inicia nem autoriza auditoria de outro projeto. FAEPA
-permanece fora do escopo.
+não faz parte dessa referência sintética.
 
 O pacote identifica-se como `audit3 0.2.0`; não foi criada uma nova tag de release.
 O código utilizado está identificado pelos hashes e patches dos registros de
 validação, não apenas pelo número do pacote.
+
+As correções posteriores de aquisição, lotes, compactação e contexto tiveram
+**817 testes locais aprovados, zero falhas e oito integrações Docker/live não
+executadas** em 16/11/2026. Não houve nova execução real completa dos três agentes
+dessas alterações. Os 602 testes abaixo pertencem à reavaliação histórica de 12/11.
+Veja [aquisição local](aquisicao-local.md) e [contexto dos agentes](contexto-dos-agentes.md)
+para os contratos atuais e seus limites de comprovação.
 
 
 **Publicação:** os artefatos operacionais indicados abaixo permanecem privados na
@@ -32,7 +39,7 @@ oficial isolado `0.167.0`. O controlador executado corresponde ao commit
 | Reavaliação offline dos mesmos registros | **24/24**, conclusão revisada `completed` |
 | Ressalvas narrativas examinadas | 72: 39 notas de escopo e 33 de procedimento; nenhuma bloqueante ou pendente para o objetivo |
 | Avaliador da reavaliação | `scoped-assessment-5`, política `explicit-narrative-v1` |
-| Suíte local final | **602 aprovados, zero falhas, oito integrações Docker/live não executadas na etapa offline** |
+| Suíte local da reavaliação de 12/11 | **602 aprovados, zero falhas, oito integrações Docker/live não executadas na etapa offline** |
 
 O baseline e as reproduções dos três papéis demonstram `(10, 3) → 13`, quando o
 contrato exige `7`. As guardas de entradas inválidas e a autorização administrativa

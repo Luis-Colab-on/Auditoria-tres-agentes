@@ -35,6 +35,7 @@ class Config(Contract):
     input_usd_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     output_usd_per_million: float | None = Field(default=None, ge=0, allow_inf_nan=False)
     exclude: list[str] = Field(default_factory=list)
+    runtime_include: list[str] = Field(default_factory=list, exclude_if=lambda value: not value)
     prior_reports: list[str] = Field(default_factory=lambda: ["audits/**", "audit-reports/**"])
     github_allowlist: list[str] = Field(default_factory=list)
     max_files: int = Field(default=10000, ge=1, le=100000)

@@ -19,12 +19,18 @@ A reavaliação **offline** dos mesmos registros aprovou **24/24** após revisar
 72 ressalvas narrativas: 39 notas de escopo e 33 de procedimento. A política
 `explicit-narrative-v1` vincula cada decisão ao objetivo, texto integral, origens,
 revisor e evidências atuais, preservando os bloqueios estruturais e os originais.
-A suíte local final teve **602 testes aprovados, zero falhas e oito integrações
+A suíte local dessa reavaliação de 12/11 teve **602 testes aprovados, zero falhas e oito integrações
 Docker/live não executadas nessa etapa offline**.
 
 **A última alteração do avaliador não passou por uma nova execução real completa.**
 A aprovação derivada refere-se à execução anterior; não demonstra auditorias de
-projetos arbitrários nem homologação de produção. FAEPA permanece fora do escopo.
+projetos arbitrários nem homologação de produção. FAEPA não faz parte dessa referência.
+
+As correções posteriores de aquisição, distribuição de lotes, compactação e contexto
+foram validadas localmente em 16/11/2026: **817 testes aprovados, zero falhas e oito
+integrações Docker/live não executadas nessa rodada**. Essas alterações ainda não
+passaram por nova execução real completa dos três agentes. Consulte os procedimentos
+de [aquisição local](docs/aquisicao-local.md) e [contexto dos agentes](docs/contexto-dos-agentes.md).
 
 Consulte o **[guia de uso da versão validada](docs/uso-versao-validada.md)** para
 preparação local, delimitação de escopo, comandos exatos, conferência financeira,

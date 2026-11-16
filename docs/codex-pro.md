@@ -144,6 +144,147 @@ ambíguo. A retomada não repete esse turno; precisa de revisão explícita dos 
 O programa não decide que um turno remoto ambíguo teve sucesso. Testes confirmados
 continuam reutilizados por fingerprint/receipt do executor existente.
 
+### Planejamento de leituras e diagnóstico de rejeições
+
+Cada entrada inclui `controller_turn_limits`: teto efetivo de ferramentas, linhas
+por leitura, corte de 16.000 bytes de texto da fonte e prazo por turno. Cada resposta
+de ferramenta informa quantos passos restam. O teto conta chamadas dinâmicas,
+inclusive buscas, consultas a receipts, erros e continuações de leituras truncadas.
+As leituras internas de uma busca não são chamadas dinâmicas adicionais. A chamada
+que excede o teto é recusada antes de executar a ferramenta; a reserva e o consumo
+desconhecido do turno continuam preservados.
+
+Nos lotes `initial-*`, `initial_read_plan` divide as leituras pelos limites reais
+de linhas e bytes. O plano não publica fonte como se tivesse sido consultada, nem
+produz inspeções. Pode reutilizar somente intervalos devolvidos por ferramentas
+autênticas ao próprio papel, no mesmo run, fonte e etapa cega. Analisar todo o lote
+continua obrigatório. O Juiz mantém inspeção cega dirigida, sem cobertura integral
+artificial. O plano é um mínimo de consultas, não garantia de análise ou conclusão.
+
+Antes de novas chamadas, o controlador verifica a viabilidade das leituras de todos
+os lotes iniciais pendentes. Lotes impossíveis exigem replanejamento explícito;
+não há aumento de teto, subdivisão retroativa, reciclagem de slots ou redução de
+escopo automática. Para examinar o plano separadamente, sem Docker, cliente,
+consulta de conta ou inferência:
+
+```bash
+.venv/bin/python scripts/plan_initial_reads.py --run ID \
+  --output validation/plano-leituras-novo.json
+```
+
+O comando exige arquivo novo fora do Store. Código de saída 2 indica lotes
+inviáveis. O resultado considera leituras de fonte; cada turno também inclui no
+seu plano os receipts ainda não consultados. Alterações no controlador não tornam
+válida, por si só, a versão congelada por um wrapper de execução anterior. A
+recuperação precisa registrar e revisar a versão que será efetivamente usada.
+
+Quando o operador autoriza redistribuir trabalho ainda não iniciado, prepare um
+mapa versionado sem executar agentes:
+
+```bash
+.venv/bin/python scripts/repartition_initial_batches.py --run ID \
+  --reviewer 'IDENTIFICACAO_DO_REVISOR' --output validation/distribuicao-candidata.json
+```
+
+O mapa `initial-batch-distribution-1` preserva a distribuição original e identifica
+os filhos de cada lote. Divide somente lotes sem capacidade suficiente para leitura
+e reservas: duas leituras de contexto, duas consultas adicionais de evidência,
+duas submissões de teste e consulta dos baselines. São reservas de capacidade,
+não obrigações de produzir achados/testes, nem autorização para exceder o limite
+global de reproduções. As inspeções exigidas são entregues na resposta estruturada;
+o planejamento não as conta como ferramenta nem as fabrica. A divisão é equilibrada
+por chamadas reais de leitura, considerando também o corte por bytes.
+
+Após revisar e validar, o mesmo comando com `--apply` e outro arquivo de saída novo
+registra o mapa de forma imutável no run. Esse registro é uma ação explícita do
+operador, fora das ferramentas dos agentes. Alterações de atribuição em qualquer
+fase já iniciada, perda/sobreposição de intervalos, divergência de fonte/configuração,
+redução dos contadores ou mudança dos checkpoints protegidos são recusadas.
+Fases novas e a barreira recebem o identificador da distribuição; a conclusão e
+o relatório exigem todos os lotes efetivos. Nenhum lote é concluído pelo ato de
+redistribuir. Runs sem esse registro mantêm seu mapa original.
+
+Uma tentativa extraordinária continua exigindo autorização separada para um único
+papel/fase/slot. A autorização pode vincular por hash todas as tentativas e checkpoints
+anteriores. O mapa não cria tentativas, não amplia tetos e não renova fatos financeiros.
+O tipo do item nativo da segunda interrupção histórica do FAEPA continua desconhecido:
+melhorar seu diagnóstico não demonstra que a incompatibilidade foi resolvida.
+
+### Compactação automática de contexto
+
+O contrato 0.167.0 define `contextCompaction` como item de ciclo de vida. O auditor
+valida as notificações `item/started` e `item/completed`: sessão e turno atuais,
+mesmo ID de item, início único e conclusão correspondente. São obrigatórios
+`startedAtMs` no início e `completedAtMs` no fim, conforme os contratos arquivados
+em `tests/contracts/ItemStartedNotification.json` e `ItemCompletedNotification.json`.
+Os timestamps são metadados do cliente; não ajustam relógios, prazos ou conferências
+financeiras. IDs de itens não podem mudar de tipo ou ser reutilizados nessa sequência.
+
+Compactação não consome passos de ferramenta, não devolve leitura, não produz
+inspeção/cobertura e não substitui resposta final. Turno sem conclusão de compactação
+ou sem resposta final permanece interrompido/ambíguo. Os cinco tools existentes,
+o contraditório e a barreira cega mantêm seus contratos. Outros itens nativos e tipos
+desconhecidos continuam bloqueados; não se amplia permissão de execução.
+
+A validade factual original e os prazos monotônicos são reconferidos ao consumir
+eventos, inclusive quando a fila devolve dados imediatamente. A compactação fica
+dentro do mesmo turno, reserva e orçamento acumulado, sem reiniciar contadores ou
+liberar slots. O controlador registra somente ciclo de vida e correlação por hash,
+sem resumo de compactação, frames ou raciocínio privado.
+
+O texto JSON enviado ao cliente usa serialização sem espaços entre campos. O manifesto
+integral permanece no controlador; `agent-manifest-1` fornece o objetivo e as restrições
+originais, hashes verificáveis e o catálogo compacto de toda fonte legível. Os metadados
+integrais continuam consultáveis com `list_source(offset, limit)`. Depois de uma entrega
+comprovada em turno concluído da mesma sessão/papel, entradas posteriores referenciam
+o catálogo, sem repeti-lo. Compactação pode exigir nova consulta; referência não é
+leitura ou inspeção. O histórico não é apagado, reescrito ou resumido pelo controlador.
+Essa redução de bytes não garante evitar compactação: o histórico acumulado continua
+sujeito ao cliente oficial. Veja [contexto dos agentes](contexto-dos-agentes.md).
+
+Regressões reproduzíveis, somente locais e sem provocar compactação real:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 \
+  .venv/bin/python -m pytest -q tests/test_context_compaction.py
+```
+
+A fixture declara os campos reconstruídos: ID sintético, correlações substituídas,
+timestamp não preservado no diagnóstico e notificação de conclusão sintética.
+O segundo bloqueio histórico continua com tipo desconhecido. A correção local do
+terceiro evento não reclassifica os registros anteriores nem recupera sua tentativa.
+
+### Exceção encadeada após um slot extraordinário consumido
+
+`chained-extra-attempt-1` permite somente um slot fixo após a primeira autorização
+extraordinária existente. O registro `roles/PAPEL/attempts/FASE-extra-authorization-v2`
+é novo e imutável; não substitui a autorização anterior. Exige autorização explícita
+para aquele papel/fase/slot e vínculo por hash ao pai, às tentativas/checkpoints
+anteriores e às respectivas confirmações oficiais `interrupted`. Estado ativo,
+concluído, de outra sessão ou sem evidência oficial é recusado.
+
+A autorização também vincula fonte, configuração, perfil, distribuição, atribuição,
+sessão do papel, backend e versão congelada do pacote. O verificador confere os
+hashes dos arquivos carregados e preserva o prefixo do ledger e o piso de tempo
+acumulado. A versão congelada preserva os mesmos contadores anteriores. Não há
+liberação de um slot seguinte por falha, resposta inválida, falta de envio ou timeout.
+Uma tentativa válida pode prosseguir para as fases normais, com seus slots originais.
+
+Essa autorização é preparação local do operador, separada da confirmação financeira.
+Ela não inicia inferência, não renova seu horário e não altera tetos, modelos, esforço,
+serviço ou permissões de ferramenta. Antes da execução continuam obrigatórios o
+preflight oficial e os fatos financeiros atuais na mesma conta. Uma nova versão ou
+um registro de autorização não transforma correção local em validação real do auditor.
+
+Rejeições do protocolo guardam `runtime-protocol-diagnostic-1` no checkpoint e em
+evento autenticado: método, tipo reconhecido no contrato fixado, papel, fase,
+índice da tentativa, contagem e identificadores de correlação. Nomes desconhecidos
+e identificadores fornecidos pelo par são registrados por hash. Não são gravados
+frames, argumentos, texto de itens, raciocínio ou credenciais. Falta histórica do
+tipo rejeitado permanece desconhecida; não se deduz o tipo pela proximidade de
+outros eventos. Tanto `item/started` quanto `item/completed` rejeitam itens fora
+da lista restrita existente; reconhecer um nome para diagnóstico não o autoriza.
+
 Um timeout não libera repetição automática. Quando `thread/read` do cliente oficial
 confirma o turno como `interrupted`, uma revisão explícita pode registrar
 `attempt-N-interrupted`, vinculada ao mesmo invocation/thread/turn. A retomada

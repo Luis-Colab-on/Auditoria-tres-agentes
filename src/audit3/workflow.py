@@ -20,6 +20,8 @@ from .causality import causal_groups
 from .completion import assess_completion, VERSION as ASSESSMENT_VERSION
 from .operational import total_seconds
 from .investigation import is_blind, validate_initial_output, validate_saved_initial, assess_independent_investigation
+from .batch_distribution import effective_batches, distribution, tool_reserves, assignment_for_phase
+from .agent_context import agent_manifest
 
 
 def batches(manifest: RunManifest, line_limit: int):
@@ -155,6 +157,12 @@ class Workflow:
             self.store.put(self.run_id, certificate_name, certificates, immutable=True)
 
     async def invoke(self, role: str, phase: str, assignment=None, final=False):
+        current_distribution = distribution(self.store, self.manifest, self.config)
+        if phase.startswith('initial-'):
+            expected_assignment = assignment_for_phase(self.store, self.manifest, self.config, phase)
+            if assignment is not None and assignment != expected_assignment:
+                raise PolicyError('lote inicial diverge da distribuição efetiva')
+            assignment = expected_assignment
         name = f"roles/{role}/phases/{phase}"
         if self.store.exists(self.run_id, name):
             if is_blind(phase):
@@ -164,12 +172,15 @@ class Workflow:
             if self.store.exists(self.run_id, "cancel"):
                 raise asyncio.CancelledError
             self.update(phase=phase)
-            payload = {"phase": phase, "role": role, "manifest": self.manifest.model_dump(mode="json"),
+            payload = {"phase": phase, "role": role, "manifest": agent_manifest(
+                self.store, self.manifest, self.store.exists(self.run_id, 'barrier')),
                 "financial_restriction": financial_policy(),
                 "assignment": assignment, "own_observations": self.opinions(role) if self.runtime.mode != "codex-app-server" else [],
                 "baseline_receipts": self.store.get(self.run_id, "baseline")["ids"],
                 "comparison_ids": self.store.names(self.run_id, "comparisons"),
                 "instruction": "Leia os intervalos atribuídos via ferramentas. Declare lacunas. Em debate retorne posições; final exige decisão por achado."}
+            if current_distribution:
+                payload['batch_distribution_id'] = current_distribution['id']
             if self.store.exists(self.run_id, "assessment/smoke-contract"):
                 from .smoke_causality import check_marker
                 marker = check_marker(self.store, self.manifest)
@@ -183,6 +194,17 @@ class Workflow:
                 payload["published_opinions"] = self.store.get(self.run_id, phase_input) if self.store.exists(self.run_id, phase_input) else self.shared()
                 payload["finding_ids"] = list(self.findings())
                 payload["receipt_ids"] = self.store.names(self.run_id, "receipts")
+            if self.runtime.mode == 'codex-app-server' and phase.startswith('initial-') and isinstance(assignment, list):
+                from .turn_planning import initial_read_plan
+                planning_tools = SourceTools(self.store, self.manifest, self.config, None,
+                    ToolContext(self.run_id, role, phase, 'controller-planning'))
+                plan = initial_read_plan(planning_tools, assignment, payload['baseline_receipts'],
+                                         reserves=tool_reserves(self.store, self.manifest, self.config))
+                if not plan['mandatory_reads_fit']:
+                    raise BudgetExceeded('lote inicial inviável no limite de ferramentas: '
+                        f"mínimo {plan['minimum_tool_calls']}, teto {plan['max_tool_calls']}, "
+                        f"linhas não materializáveis {len(plan['unreadable_lines'])}; replanejamento necessário, sem nova chamada")
+                payload['initial_read_plan'] = plan
             if len(json.dumps(payload, ensure_ascii=False).encode()) > self.config.limits.max_input_bytes:
                 raise BudgetExceeded("entrada excede limite: cobertura parcial; reduza escopo numa nova preparação")
             attempt_count = self.config.limits.invalid_output_retries + 1
@@ -198,9 +220,23 @@ class Workflow:
                     or authorization.get('previous_invocation_id') != self.store.get(self.run_id, previous_name)['invocation_id']
                     or not self.store.exists(self.run_id, previous_name + '-interrupted')):
                     raise RuntimePaused('Exceção de tentativa adicional inválida; retomada bloqueada')
+                if 'prior_attempts' in authorization:
+                    prior_attempts = authorization['prior_attempts']
+                    if not isinstance(prior_attempts, list) or len(prior_attempts) != attempt_count:
+                        raise RuntimePaused('Vinculação das tentativas anteriores inválida')
+                    for slot, prior in enumerate(prior_attempts):
+                        old_name = name.replace('/phases/', '/attempts/') + f'-{slot}'
+                        old = self.store.get(self.run_id, old_name)
+                        old_turn = self.store.get(self.run_id, 'codex-turns/' + old['invocation_id'])
+                        if prior != {'slot': slot, 'invocation_id': old['invocation_id'],
+                                     'attempt_hash': object_hash(old), 'checkpoint_hash': object_hash(old_turn)}:
+                            raise RuntimePaused('Vinculação das tentativas anteriores inválida')
                 # One immutable authorization permits one fixed slot for this
                 # role/phase only. Its checkpoint prevents replay after failure.
                 attempt_count += 1
+            from .recovery_authorization import chained_attempt_count
+            attempt_count = chained_attempt_count(self.store, self.manifest, self.config,
+                role, phase, attempt_count, authorization_name)
             for attempt in range(attempt_count):
                 attempt_name = name.replace("/phases/", "/attempts/") + f"-{attempt}"
                 if self.store.exists(self.run_id, attempt_name):
@@ -223,12 +259,31 @@ class Workflow:
                         continue
                     if self.runtime.mode != "codex-app-server":
                         continue
-                    invocation_id = self.store.get(self.run_id, attempt_name)["invocation_id"]
+                    previous_attempt = self.store.get(self.run_id, attempt_name)
+                    invocation_id = previous_attempt['invocation_id']
+                    if current_distribution and not self.store.exists(self.run_id, 'codex-turns/' + invocation_id):
+                        if any(c.get('invocation_id') == invocation_id for c in self.store.get(self.run_id, 'ledger')['calls']):
+                            raise RuntimePaused('Reserva anterior sem checkpoint: revisão explícita necessária, sem nova reserva')
+                        if previous_attempt.get('input_hash') != object_hash(payload):
+                            # A prepared slot without reservation/dispatch is still
+                            # the same slot. Preserve its old input hash and bind
+                            # the new controller context in a separate record.
+                            self.store.put(self.run_id, attempt_name + '-distribution-continuation', {
+                                'source': 'operator_versioned_batch_distribution',
+                                'batch_distribution_id': current_distribution['id'],
+                                'original_attempt_hash': object_hash(previous_attempt),
+                                'original_input_hash': previous_attempt.get('input_hash'),
+                                'effective_input_hash': object_hash(payload),
+                                'invocation_id': invocation_id,
+                                'previous_checkpoint_absent': True, 'previous_reservation_absent': True}, immutable=True)
                 else:
                     invocation_id = secrets.token_hex(12)
-                tools = SourceTools(self.store, self.manifest, self.config, self.executor, ToolContext(self.run_id, role, phase, invocation_id))
+                tools = SourceTools(self.store, self.manifest, self.config, self.executor, ToolContext(self.run_id, role, phase, invocation_id, attempt))
                 if not self.store.exists(self.run_id, attempt_name):
-                    self.store.put(self.run_id, attempt_name, {"invocation_id": invocation_id, "started_at": now(), "input_hash": object_hash(payload)}, immutable=True)
+                    attempt_record = {"invocation_id": invocation_id, "started_at": now(), "input_hash": object_hash(payload)}
+                    if current_distribution:
+                        attempt_record['batch_distribution_id'] = current_distribution['id']
+                    self.store.put(self.run_id, attempt_name, attempt_record, immutable=True)
                 self.store.put(self.run_id, f"roles/{role}/state", {"phase": phase, "invocation_id": invocation_id, "status": "running"})
                 try:
                     result = await self.runtime.invoke(role, phase, payload, tools, final=final)
@@ -245,6 +300,8 @@ class Workflow:
                     payload["validation_feedback"] = "Saída rejeitada: " + redact(str(exc))[:1500]
                     continue
                 record = {"role": role, "phase": phase, "invocation_id": invocation_id, "published_at": now(), "mode": self.runtime.mode, "output": output.model_dump(mode="json")}
+                if current_distribution:
+                    record['batch_distribution_id'] = current_distribution['id']
                 self.store.put(self.run_id, name, record, immutable=True)
                 self.store.put(self.run_id, f"roles/{role}/state", {"phase": phase, "invocation_id": invocation_id, "status": "completed"})
                 state = self.state()
@@ -257,7 +314,7 @@ class Workflow:
         if role == "juiz":
             await self.invoke(role, "blind", {"scope": "inspeção cega de requisitos, arquitetura, entradas críticas, invariantes; escolha trechos pelo inventário"})
         else:
-            for i, batch in enumerate(batches(self.manifest, self.config.limits.batch_lines)):
+            for i, batch in enumerate(effective_batches(self.store, self.manifest, self.config)):
                 await self.invoke(role, f"initial-{i:04d}", batch)
         self.store.put(self.run_id, f"roles/{role}/initial", {"role": role, "opinions": self.opinions(role)}, immutable=True)
 
@@ -282,6 +339,13 @@ class Workflow:
             self.runtime = CodexRuntime(self.store, self.run_id, self.config)
         if isinstance(self.runtime, CodexRuntime):
             self.runtime.global_deadline = self._global_deadline
+        if self.runtime.mode == 'codex-app-server' and not self.store.exists(self.run_id, 'barrier'):
+            from .turn_planning import source_plans
+            for entry in source_plans(self.store, self.manifest, self.config):
+                if not entry['plan']['mandatory_reads_fit']:
+                    raise BudgetExceeded(f"lote inicial inviável {entry['role']}/{entry['phase']}: "
+                        f"mínimo {entry['plan']['minimum_tool_calls']} leituras, teto {self.config.limits.max_turns}; "
+                        'replanejamento necessário antes de qualquer nova chamada')
         if hasattr(self.runtime, "preflight"):
             await self.runtime.preflight()
         self.update(runtime_mode=self.runtime.mode)
@@ -303,6 +367,9 @@ class Workflow:
             if not investigation["valid"]:
                 raise PolicyError("; ".join(investigation["gaps"]))
             barrier = {"published_at": now(), "initial_hashes": {r.value: object_hash(self.store.get(self.run_id, f"roles/{r.value}/initial")) for r in Role}}
+            current_distribution = distribution(self.store, self.manifest, self.config)
+            if current_distribution:
+                barrier['batch_distribution_id'] = current_distribution['id']
             self.store.put(self.run_id, "barrier", barrier, immutable=True)
             self.store.event(self.run_id, "barrier_published", barrier)
         investigation = assess_independent_investigation(self.store, self.manifest)

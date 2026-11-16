@@ -75,7 +75,10 @@ def total_seconds(store, run_id, config, role=None, phase=None):
     from .completion import protocol_phases
     from .schemas import RunManifest
     additional = store.get(run_id, 'material-review').get('additional_round', False) if store.exists(run_id, 'material-review') else False
-    required = set(protocol_phases(RunManifest.model_validate(manifest), config, additional)) - {'juiz/final'}
+    from .batch_distribution import effective_batches
+    parsed_manifest = RunManifest.model_validate(manifest)
+    required = set(protocol_phases(parsed_manifest, config, additional,
+        initial_batches=effective_batches(store, parsed_manifest, config))) - {'juiz/final'}
     frozen = snapshot.get('phase_hashes', {})
     if set(frozen) != required or not required <= set(state['completed']) or not store.exists(run_id, 'barrier'):
         raise PolicyError('Extensão global exige todas as fases anteriores concluídas')

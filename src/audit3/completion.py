@@ -15,9 +15,12 @@ def pointer(document, path):
 def context_hash(report):
     # Bind every factual input, including receipts/streams, dispatch accounting,
     # final responses and operational interruptions. Derived review is excluded.
-    return object_hash({k: report.get(k) for k in ('manifest', 'coverage', 'opinions',
+    context = {k: report.get(k) for k in ('manifest', 'coverage', 'opinions',
         'judgment', 'causal_validation', 'proven_causal_groups', 'required_phases',
-        'state', 'receipts', 'usage', 'runtime', 'structural_checks', 'findings', 'verdicts', 'comparisons')})
+        'state', 'receipts', 'usage', 'runtime', 'structural_checks', 'findings', 'verdicts', 'comparisons')}
+    if 'batch_distribution' in report:
+        context['batch_distribution'] = report['batch_distribution']
+    return object_hash(context)
 
 
 def limitation_messages(report):
@@ -52,11 +55,11 @@ def required_phases(report):
     return required
 
 
-def protocol_phases(manifest, config, additional_round=False):
+def protocol_phases(manifest, config, additional_round=False, *, initial_batches=None):
     from .workflow import batches
     required = {f'{role}/{phase}' for role in ('auditor', 'defensor') for phase in ('contest', 'reply')}
     required |= {f'{role}/initial-{index:04d}' for role in ('auditor', 'defensor')
-                 for index, _ in enumerate(batches(manifest, config.limits.batch_lines))}
+                 for index, _ in enumerate(initial_batches if initial_batches is not None else batches(manifest, config.limits.batch_lines))}
     required |= {'juiz/blind', 'juiz/review', 'juiz/final'}
     if additional_round:
         required |= {f'{role}/{phase}' for role in ('auditor', 'defensor') for phase in ('extra-contest', 'extra-reply')}

@@ -98,7 +98,8 @@ def validate_annotation(report, message, annotation, review):
         if (scope['secret_absence_certification_required'] or not inventory
             or len({f.get('path') for f in inventory}) != len(inventory)
             or any(not f.get('path') or not re.fullmatch('[a-f0-9]{64}', f.get('sha256', ''))
-                   or f.get('category') in {'excluded', 'prior_report'} for f in inventory)
+                   or f.get('category') == 'prior_report'
+                   or (f.get('category') == 'excluded' and not f.get('runtime_only')) for f in inventory)
             or report['coverage'].get('excluded')
             or not report['coverage'].get('independent_investigation', {}).get('valid')
             or report['coverage'].get('gaps')):

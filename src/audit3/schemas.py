@@ -41,6 +41,7 @@ class FileRecord(Contract):
     lines: int = Field(ge=0)
     category: Literal["source", "spec", "test", "config", "migration", "prior_report", "excluded"]
     reason: str | None = None
+    runtime_only: bool = Field(default=False, exclude_if=lambda value: not value)
 
 
 class RunManifest(Contract):
@@ -49,7 +50,7 @@ class RunManifest(Contract):
     models: dict[str, str] | None = Field(default=None, exclude_if=lambda value: value is None)
     run_id: str
     created_at: str
-    source_kind: Literal["git", "zip", "github"]
+    source_kind: Literal["git", "zip", "github", "directory"]
     source_id: str
     commit: str | None
     origin: str | None
@@ -65,6 +66,7 @@ class RunManifest(Contract):
     estimated_input_tokens: int
     estimated_calls: int
     prior_report_policy: str = "quarentena até publicação dos três pareceres iniciais"
+    acquisition_review_hash: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class SourceRef(Contract):

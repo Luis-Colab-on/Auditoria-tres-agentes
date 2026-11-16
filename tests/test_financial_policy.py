@@ -32,9 +32,13 @@ def test_cli_preserves_actual_operator_time_instead_of_registration_time(make_ru
 
 
 @pytest.mark.parametrize('checked', [None, '[HH:MM]', '', '2026-11-11T09:00:00',
-    (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat(),
-    (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()])
+    'future', 'expired'])
 def test_absent_invalid_naive_future_and_expired_times_block(checked):
+    # Relative synthetic cases must be relative to execution, not collection:
+    # a long suite must not turn the "future" rejection into a valid timestamp.
+    if checked in {'future', 'expired'}:
+        minutes = 2 if checked == 'future' else -31
+        checked = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
     with pytest.raises(RuntimePaused):
         financial_remaining(checked)
 

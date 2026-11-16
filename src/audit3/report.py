@@ -99,11 +99,16 @@ def coverage(store: Store, manifest: RunManifest):
         gaps.append("Nenhum teste efetivamente executado no ambiente isolado.")
     if any(r["status"] in {"blocked", "not_executed", "cancelled"} for r in receipts):
         gaps.append("Há verificações bloqueadas/não executadas/canceladas; consulte receipts.")
-    excluded = [f.model_dump() for f in manifest.files if f.category == "excluded"]
+    excluded = [f.model_dump() for f in manifest.files if f.category == "excluded" and not f.runtime_only]
     if excluded:
         gaps.append(f"{len(excluded)} arquivos omitidos: escopo limitado pelo inventário.")
-    return {"roles": roles, "independent_investigation": independent, "excluded": excluded, "executed_test_receipts": executed, "gaps": gaps,
+    result = {"roles": roles, "independent_investigation": independent, "excluded": excluded, "executed_test_receipts": executed, "gaps": gaps,
         "interpretation": "Leitura e análise abaixo consideram somente investigação inicial autenticada antes da barreira. Juiz realiza inspeção dirigida, sem exigência de cobertura integral. Inventário, leitura, análise, fluxo declarado e execução são medidas distintas; não provam compreensão integral."}
+    runtime = [f.model_dump() for f in manifest.files if f.runtime_only]
+    if runtime:
+        result['runtime_dependencies'] = runtime
+        result['runtime_interpretation'] = 'Bytes preservados/verificados para execução; não enviados aos modelos nem auditados como código próprio. Compatibilidade e efeitos exigem evidências de testes.'
+    return result
 
 
 def intervals(values):
@@ -213,7 +218,13 @@ def build_report(store: Store, run_id: str, *, use_review=True):
     review_name = 'assessment/completion-review'
     additional_round = (store.get(run_id, 'material-review')['additional_round']
                         if store.exists(run_id, 'material-review') else False)
-    report['required_phases'] = protocol_phases(manifest, Config.model_validate(store.get(run_id, 'config')), additional_round)
+    from .batch_distribution import effective_batches, distribution
+    config = Config.model_validate(store.get(run_id, 'config'))
+    batch_distribution = distribution(store, manifest, config)
+    report['required_phases'] = protocol_phases(manifest, config, additional_round,
+        initial_batches=effective_batches(store, manifest, config))
+    if batch_distribution:
+        report['batch_distribution'] = batch_distribution
     report['structural_checks'] = structural_checks(store, manifest, state, judgment)
     review = store.get(run_id, review_name) if use_review and store.exists(run_id, review_name) else None
     report['completion_review'] = review

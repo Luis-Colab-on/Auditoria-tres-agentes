@@ -6,6 +6,9 @@ from .evidence import Store
 from .executor import Executor
 from .schemas import EvidenceReceipt, InspectionRecord, RunManifest, SourceRef, TestRequest
 from .security import PolicyError, contained, digest, object_hash, redact
+from .agent_context import visible_inventory, inventory_reference
+
+SOURCE_READ_MAX_BYTES = 16000
 
 
 @dataclass(frozen=True)
@@ -14,6 +17,7 @@ class ToolContext:
     role: str
     phase: str
     invocation_id: str
+    attempt: int | None = None
 
 
 class SourceTools:
@@ -54,9 +58,13 @@ class SourceTools:
         self.check()
         if offset < 0 or not 1 <= limit <= 200:
             raise PolicyError("paginação inválida")
-        records = [f for f in self.manifest.files if f.category != "prior_report" or self.published()]
+        published = self.published()
+        records = visible_inventory(self.manifest, published)
         self.log("list_source", {"offset": offset, "count": min(limit, len(records[offset:]))})
-        return {"files": [f.model_dump() for f in records[offset:offset+limit]], "next_offset": offset + limit if offset + limit < len(records) else None}
+        page = records[offset:offset+limit]
+        return {"files": page, "next_offset": offset + limit if offset + limit < len(records) else None,
+                'inventory_ref': inventory_reference(self.store, self.manifest, published),
+                'offset': offset, 'page_sha256': object_hash(page)}
 
     def read_source(self, path: str, start: int = 1, end: int = 160):
         self.check()
@@ -75,7 +83,7 @@ class SourceTools:
         partial_line = None
         for n in range(start, last + 1):
             line = lines[n - 1]
-            if size + len(line.encode()) > 16000:
+            if size + len(line.encode()) > SOURCE_READ_MAX_BYTES:
                 partial_line = n
                 break
             output.append({"line": n, "text": line})

@@ -10,8 +10,16 @@ from .codex_rpc import BACKEND, CLI_VERSION, StdioRPC, TurnDispatch, DispatchExp
 from .codex_policy import (account_identity, check_effective_config, executable, financial_check, financial_policy, financial_remaining,
                            select_effort, setup_home, verify_client)
 from .schemas import Judgment, Opinion, TestRequest
-from .security import now, object_hash, sensitive
+from .security import now, object_hash, sensitive, digest
 from .operational import turn_timeout, total_seconds
+from .runtime_diagnostics import ProtocolViolation, rejection
+from .tools import SOURCE_READ_MAX_BYTES
+from .compaction import CompactionLifecycle
+from .agent_context import prepare_turn_context
+
+
+class TurnExpired(TimeoutError):
+    """An already dispatched turn exhausted its unchanged monotonic deadline."""
 
 
 def output_schema(model):
@@ -118,7 +126,16 @@ class CodexRuntime:
                 '\nO campo financial_context de cada entrada é fornecido pelo controlador após o preflight efetivo. '
                 'status=verified_facts documenta a conferência factual válida e as consultas oficiais aprovadas para usar a franquia incluída. '
                 'Use esses fatos para executar a tarefa; não exija nova conferência apenas pela mudança de fase. '
-                'Esse contexto não autoriza gastos adicionais nem substitui os bloqueios financeiros do controlador.',
+                'Esse contexto não autoriza gastos adicionais nem substitui os bloqueios financeiros do controlador. '
+                'controller_turn_limits e initial_read_plan são metadados do controlador. '
+                'O teto conta todas as chamadas de ferramenta, inclusive buscas, erros e continuações de leitura. '
+                'Planeje as leituras obrigatórias antes de explorar outros arquivos. As respostas informam '
+                'os passos restantes; finalize o contrato antes de esgotá-los. O plano não substitui investigação. '
+                'agent-manifest-1 referencia o manifesto integral imutável no controlador. O catálogo '
+                'contém toda fonte legível, inclusive dependências fora do lote. list_source(offset, limit) '
+                'permite recuperar metadados integrais e verificar hashes. Se o catálogo não estiver '
+                'no contexto após compactação/retomada, consulte a ferramenta; referências não são '
+                'leitura, inspeção ou prova de que informação foi preservada pela compactação.',
             'config': {'model_reasoning_effort': effective['effort']}, 'runtimeWorkspaceRoots': []}
         if self.store.exists(self.run_id, name):
             record = self.store.get(self.run_id, name)
@@ -148,11 +165,16 @@ class CodexRuntime:
 
     async def dispatch_tool(self, msg, tools, thread_id, turn_id, count):
         p = msg.get('params', {})
-        if p.get('threadId') != thread_id or p.get('turnId') != turn_id or p.get('namespace') is not None:
-            raise RuntimePaused('Tentativa de acesso entre sessões/turnos/namespaces')
+        if not isinstance(p, dict) or p.get('threadId') != thread_id or p.get('turnId') != turn_id or p.get('namespace') is not None:
+            raise rejection('Tentativa de acesso entre sessões/turnos/namespaces', 'tool_identity',
+                msg, tools.context, thread_id, turn_id, count, self.config.limits.max_turns)
         name = p.get('tool')
-        if name not in {s['name'] for s in tool_specs()} or count > self.config.limits.max_turns:
-            raise RuntimePaused('Ferramenta fora do escopo/limite de passos')
+        if not isinstance(name, str) or name not in {s['name'] for s in tool_specs()}:
+            raise rejection('Ferramenta fora do escopo', 'tool_not_allowed',
+                msg, tools.context, thread_id, turn_id, count, self.config.limits.max_turns)
+        if count > self.config.limits.max_turns:
+            raise rejection('Limite de passos de ferramenta excedido', 'tool_step_limit',
+                msg, tools.context, thread_id, turn_id, count, self.config.limits.max_turns)
         args = p.get('arguments')
         if not isinstance(args, dict):
             raise RuntimePaused('Argumentos de ferramenta inválidos')
@@ -178,7 +200,12 @@ class CodexRuntime:
         except Exception as exc:
             tools.log('rejected', {'error_type': type(exc).__name__})
             result = {'success': False, 'contentItems': [{'type': 'inputText', 'text': 'Ferramenta recusada: ' + type(exc).__name__}]}
+        result['contentItems'].append({'type': 'inputText', 'text': json.dumps({
+            'controller_tool_budget': {'max_tool_calls': self.config.limits.max_turns,
+                'requested_tool_calls': count, 'remaining_tool_calls': self.config.limits.max_turns - count,
+                'instruction': 'Inclui buscas, erros e leituras truncadas. Não exceda o teto; finalize o contrato com análise dos intervalos obrigatórios.'}}, ensure_ascii=False)})
         await self.rpc.respond(msg['id'], result)
+        return result['success']
 
     async def invoke(self, role, phase, payload, tools, final=False):
         async with self.lock:
@@ -223,11 +250,24 @@ class CodexRuntime:
                 'authentication': effective['authentication'], 'planType': effective['plan'],
                 **effective['financial'], 'auto_recharge': 'disabled', 'extra_credits': 'none',
                 'remaining_valid_seconds': remaining, 'additional_spending_authorized': False}
-            turn_payload = {**payload, 'financial_context': financial_context}
+            context_payload, agent_context = prepare_turn_context(self.store, tools.manifest,
+                payload, role, thread_id, tools.published())
+            turn_payload = {**context_payload, 'financial_context': financial_context,
+                'controller_turn_limits': {'max_tool_calls': self.config.limits.max_turns,
+                    'max_read_lines': self.config.limits.read_lines,
+                    'max_source_response_bytes': SOURCE_READ_MAX_BYTES,
+                    'turn_timeout_seconds': turn_limit,
+                    'attempt': tools.context.attempt,
+                    'instruction': 'Teto total de chamadas de ferramenta neste turno, incluindo buscas, testes, erros e continuações por truncamento. Planeje e finalize antes de esgotar; não dispense leitura ou inspeção obrigatória.'}}
             financial_deadline = financial_anchor + remaining
             if global_deadline <= loop.time():
                 raise BudgetExceeded('limite de tempo total acumulado atingido')
             started_monotonic = loop.time()
+            def activity(stage, **metadata):
+                self.store.event(self.run_id, 'runtime_activity', {
+                    'version': 'runtime-timing-1', 'role': role, 'phase': phase,
+                    'invocation_id': tools.context.invocation_id, 'stage': stage,
+                    'elapsed_monotonic_seconds': loop.time() - started_monotonic, **metadata})
             deadline_origin, deadline_at = min((('turn_deadline', started_monotonic + turn_limit),
                 ('global_deadline', global_deadline), ('financial_deadline', financial_deadline)), key=lambda item: item[1])
             dispatch = TurnDispatch(deadline_at, deadline_origin,
@@ -241,27 +281,48 @@ class CodexRuntime:
                     'turn_limit_seconds': turn_limit, 'deadline_origin': deadline_origin,
                     'effective_turn_seconds': max(0, deadline_at - loop.time()),
                     'global_remaining_seconds': max(0, global_deadline - loop.time())}}
+            if agent_context:
+                record['agent_context'] = agent_context
             self.store.put(self.run_id, checkpoint, record)
             self.store.event(self.run_id, 'runner_started', {**record, 'session': thread_id, 'mode': self.mode,
                 'model': effective['model'], 'client_version': CLI_VERSION})
-            turn_id, usage = None, None
+            turn_id, usage, steps, compactions = None, None, 0, None
             financial_timeout = deadline_origin == 'financial_deadline'
             deadline = asyncio.timeout_at(deadline_at)
             operation, last_event, last_event_at = 'rpc:turn/start', None, None
             try:
                 async with deadline:
                     financial_remaining(effective['financial']['checked_at'])
+                    text = json.dumps(turn_payload, ensure_ascii=False, separators=(',', ':'))
+                    record['payload_measurement'] = {'utf8_bytes': len(text.encode('utf-8')),
+                        'object_sha256': object_hash(turn_payload), 'utf8_sha256': digest(text.encode('utf-8')),
+                        'unit': 'bytes; not tokens'}
+                    if record['payload_measurement']['utf8_bytes'] > self.config.limits.max_input_bytes:
+                        raise BudgetExceeded('entrada efetiva excede limite de bytes; nenhum turno enviado')
+                    self.store.put(self.run_id, checkpoint, record)
+                    activity('dispatch_preparation_finished')
                     response = await self.rpc.request('turn/start', {'threadId': thread_id,
-                        'input': [{'type': 'text', 'text': json.dumps(turn_payload, ensure_ascii=False)}],
+                        'input': [{'type': 'text', 'text': text}],
                         'model': effective['model'], 'effort': effective['effort'], 'serviceTierForTurn': 'default',
                         'environments': [], 'outputSchema': output_schema(Judgment if final else Opinion)}, dispatch=dispatch)
+                    activity('turn_start_returned')
                     turn_id = response['turn']['id']
+                    compactions = CompactionLifecycle(self.store, tools.context, thread_id, turn_id, self.config.limits.max_turns,
+                        elapsed=lambda: loop.time() - started_monotonic)
                     record.update(status='running', turn_id=turn_id, dispatch_status=dispatch.status)
                     self.store.put(self.run_id, checkpoint, record)
                     output, steps = None, 0
                     while True:
-                        operation = 'event_stream'
+                        operation = 'context_compaction' if compactions.active else 'event_stream'
+                        # A nonempty queue can return synchronously. Recheck at
+                        # consumption, without resetting/extending any deadline.
+                        financial_remaining(effective['financial']['checked_at'])
+                        if loop.time() >= deadline_at:
+                            raise TurnExpired(deadline_origin)
                         msg = await self.rpc.events.get()
+                        financial_remaining(effective['financial']['checked_at'])
+                        if loop.time() >= deadline_at:
+                            raise TurnExpired(deadline_origin)
                         method, p = msg.get('method'), msg.get('params', {})
                         last_event, last_event_at = method, now()
                         if method == 'audit3/transportLost':
@@ -275,15 +336,30 @@ class CodexRuntime:
                         if 'id' in msg:
                             if method != 'item/tool/call':
                                 # All native approvals, auth refresh elicitation, etc. fail closed.
-                                await self.rpc.send({'id': msg['id'], 'error': {'code': -32601, 'message': 'audit3: request denied'}})
-                                raise RuntimePaused('Solicitação nativa não autorizada')
+                                violation = rejection('Solicitação nativa não autorizada', 'native_request',
+                                    msg, tools.context, thread_id, turn_id, steps, self.config.limits.max_turns)
+                                try:
+                                    await self.rpc.send({'id': msg['id'], 'error': {'code': -32601, 'message': 'audit3: request denied'}})
+                                finally:
+                                    raise violation
                             steps += 1
-                            operation = 'tool:' + str(p.get('tool', 'unknown'))[:64]
-                            await self.dispatch_tool(msg, tools, thread_id, turn_id, steps)
+                            operation = 'tool:' + (p['tool'] if isinstance(p.get('tool'), str) and p['tool'] in {s['name'] for s in tool_specs()} else 'unknown')
+                            activity('tool_request_consumed', tool=operation[5:], step=steps)
+                            try:
+                                success = await self.dispatch_tool(msg, tools, thread_id, turn_id, steps)
+                            except BaseException as exc:
+                                activity('tool_dispatch_failed', tool=operation[5:], step=steps, error_type=type(exc).__name__)
+                                raise
+                            activity('tool_result_returned', tool=operation[5:], step=steps, success=success)
                         elif method in {'item/completed', 'turn/completed', 'thread/tokenUsage/updated', 'item/started'}:
+                            if not isinstance(p, dict):
+                                raise rejection('Evento malformado', 'event_structure', msg, tools.context,
+                                    thread_id, turn_id, steps, self.config.limits.max_turns)
                             if p.get('threadId') != thread_id:
                                 raise RuntimePaused('Evento de outra sessão')
-                            reported_turn_id = p.get('turnId', p.get('turn', {}).get('id'))
+                            reported_turn_id = p.get('turnId')
+                            if reported_turn_id is None and isinstance(p.get('turn'), dict):
+                                reported_turn_id = p['turn'].get('id')
                             if reported_turn_id != turn_id:
                                 if method == 'thread/tokenUsage/updated' and reported_turn_id in prior_turn_ids:
                                     self.store.event(self.run_id, 'historical_usage_ignored', {
@@ -293,8 +369,16 @@ class CodexRuntime:
                                     continue
                                 raise RuntimePaused('Evento de outro turno')
                             item = p.get('item', {})
-                            if method == 'item/started' and item.get('type') not in {'userMessage', 'agentMessage', 'reasoning', 'dynamicToolCall'}:
-                                raise RuntimePaused('Ferramenta/item nativo detectado; isolamento incompatível')
+                            if method in {'item/started', 'item/completed'} and isinstance(item, dict) and item.get('type') == 'contextCompaction':
+                                compactions.observe(msg, steps)
+                                continue
+                            if method in {'item/started', 'item/completed'} and (not isinstance(item, dict)
+                                or not isinstance(item.get('type'), str)
+                                or item['type'] not in {'userMessage', 'agentMessage', 'reasoning', 'dynamicToolCall'}):
+                                raise rejection('Ferramenta/item nativo detectado; isolamento incompatível', 'native_item',
+                                    msg, tools.context, thread_id, turn_id, steps, self.config.limits.max_turns)
+                            if method in {'item/started', 'item/completed'}:
+                                compactions.observe_other(msg, steps)
                             if method == 'item/completed' and item.get('type') == 'agentMessage' and item.get('phase') == 'final_answer':
                                 output = item['text']
                                 if len(output.encode()) > self.config.limits.max_output_bytes:
@@ -309,15 +393,22 @@ class CodexRuntime:
                                 usage = SimpleNamespace(input_tokens=None, output_tokens=None,
                                     official_sample={'counters': counters, 'basis': 'official request sample and cumulative thread counters; not additive per-turn totals'})
                             if method == 'turn/completed':
+                                compactions.require_complete(msg, steps)
                                 if p['turn']['status'] != 'completed' or output is None:
                                     raise RuntimePaused('Turno sem saída final confirmada')
                                 break
+                        elif isinstance(p, dict) and isinstance(p.get('item'), dict) and p['item'].get('type') == 'contextCompaction':
+                            raise compactions.reject('Método de compactação fora do contrato',
+                                'context_compaction_structure', msg, steps)
                         elif method == 'error':
                             raise RuntimePaused('Erro oficial de turno; sem retry automático')
                 if sensitive(output):
                     raise RuntimePaused('Saída com possível segredo/PII; não persistida')
                 # Only observable final answer persists. No raw frames/reasoning/history.
-                record.update(status='completed', output=output, finished_at=now(), usage=vars(usage) if usage else None)
+                record.update(status='completed', output=output, finished_at=now(),
+                    usage=vars(usage) if usage else None, tool_requests=steps)
+                if compactions and compactions.summary()['started']:
+                    record['context_compaction'] = compactions.summary()
                 self.store.put(self.run_id, checkpoint, record)
                 await self.budget.finish(cid, usage, dispatch_status=dispatch.status)
                 self.store.event(self.run_id, 'runner_completed', {'role': role, 'phase': phase,
@@ -325,9 +416,14 @@ class CodexRuntime:
                 return output
             except BaseException as exc:
                 record.update(status='ambiguous' if dispatch.write_attempted else 'not_sent',
-                    dispatch_status=dispatch.status, error_type=type(exc).__name__)
+                    dispatch_status=dispatch.status, error_type=type(exc).__name__, tool_requests=steps)
+                if compactions and compactions.summary()['started']:
+                    record['context_compaction'] = compactions.summary()
+                if isinstance(exc, ProtocolViolation):
+                    record['protocol_failure'] = exc.metadata
+                    self.store.event(self.run_id, 'runtime_protocol_rejected', exc.metadata)
                 if isinstance(exc, TimeoutError):
-                    origin = deadline_origin if deadline.expired() or isinstance(exc, DispatchExpired) else ('rpc_timeout' if operation.startswith('rpc:') else 'operation_timeout')
+                    origin = deadline_origin if deadline.expired() or isinstance(exc, (DispatchExpired, TurnExpired)) else ('rpc_timeout' if operation.startswith('rpc:') else 'operation_timeout')
                     record['timeout'] = {'origin': origin, 'operation': operation,
                         'turn_limit_seconds': turn_limit,
                         'rpc_limit_seconds': getattr(self.rpc, 'timeout', 20),
@@ -342,7 +438,7 @@ class CodexRuntime:
                         pass
                 # Close transport so a paused turn cannot keep invoking tools.
                 await self.close()
-                if isinstance(exc, TimeoutError) and (deadline.expired() or isinstance(exc, DispatchExpired)) and financial_timeout:
+                if isinstance(exc, TimeoutError) and (deadline.expired() or isinstance(exc, (DispatchExpired, TurnExpired))) and financial_timeout:
                     when = 'durante o turno' if dispatch.write_attempted else 'antes do envio'
                     raise RuntimePaused(f'Verificação financeira expirou {when}; progresso salvo, sem retry ou alternativa paga') from None
                 if isinstance(exc, TimeoutError):

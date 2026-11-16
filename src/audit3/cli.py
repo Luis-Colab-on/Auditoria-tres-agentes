@@ -79,6 +79,8 @@ def main(argv=None):
     p.add_argument("--profile", default="generic")
     p.add_argument("--config", type=Path)
     p.add_argument("--requirements", type=Path)
+    p.add_argument('--directory', action='store_true', help='congelar bytes atuais de um diretório revisado, sem Git/checkout')
+    p.add_argument('--source-review', type=Path, help='revisão explícita de sinais do scanner, fora da fonte auditada')
     r = sub.add_parser("run")
     r.add_argument("--prepared", required=True)
     comparison = sub.add_parser("compare", help="registrar comparação factual antes/depois")
@@ -131,7 +133,8 @@ def main(argv=None):
             return 0
         if args.command == "prepare":
             from .snapshot import prepare
-            m = prepare(store, args.repo, args.ref, load_profile(args.profile), load_config(args.config), args.requirements.read_text() if args.requirements else "")
+            m = prepare(store, args.repo, args.ref, load_profile(args.profile), load_config(args.config), args.requirements.read_text() if args.requirements else "",
+                directory=args.directory, source_review=json.loads(args.source_review.read_text()) if args.source_review else None)
             emit({"prepared": m.run_id, "source_id": m.source_id, "inventory_files": len(m.files), "estimated_input_tokens": m.estimated_input_tokens,
                 "estimated_runner_calls": m.estimated_calls, "model_turns": 0, "next": "Revise inventário/omissões e execute audit3 run --prepared ID. O código consultado será processado remotamente pela OpenAI via Codex."})
             return 0

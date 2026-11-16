@@ -1,0 +1,19 @@
+{
+  "client_version": "0.167.0",
+  "provenance": {
+    "kind": "sanitized reconstruction, not a captured wire frame",
+    "recorded_values": {"method": "item/started", "item_type": "contextCompaction"},
+    "reconstructed_fields": {
+      "/events/0/params/threadId": "synthetic replacement of recorded session correlation",
+      "/events/0/params/turnId": "synthetic replacement of recorded turn correlation",
+      "/events/0/params/startedAtMs": "required by the pinned notification schema; not retained in historical diagnostic",
+      "/events/0/params/item/id": "synthetic ID; historical diagnostic retained only its SHA256",
+      "/events/1": "entire completion notification is synthetic; historical turn was interrupted at start"
+    },
+    "interpretation": "The second historical rejected type remains unknown. This fixture reproduces the third event classification only."
+  },
+  "events": [
+    {"method": "item/started", "params": {"threadId": "MOCK-thread", "turnId": "MOCK-turn", "startedAtMs": 1700000000000, "item": {"id": "MOCK-compaction", "type": "contextCompaction"}}},
+    {"method": "item/completed", "params": {"threadId": "MOCK-thread", "turnId": "MOCK-turn", "completedAtMs": 1700000000010, "item": {"id": "MOCK-compaction", "type": "contextCompaction"}}}
+  ]
+}
