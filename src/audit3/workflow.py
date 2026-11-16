@@ -6,7 +6,7 @@ import time
 from datetime import datetime, timezone
 from importlib.resources import files
 from pydantic import ValidationError
-from .agents import BudgetExceeded, RuntimePaused, PersistencePending
+from .agents import BudgetExceeded, RuntimePaused, PersistencePending, ReservationPending
 from .codex_runtime import CodexRuntime
 from .codex_policy import financial_policy
 from .config import Config, Profile
@@ -122,6 +122,10 @@ class Workflow:
             self.runtime = CodexRuntime(self.store, self.run_id, self.config)
         if isinstance(self.runtime, CodexRuntime):
             await self.runtime.budget.reconcile()
+            from .recovery import settle_not_sent_decisions
+            settled = await settle_not_sent_decisions(self.store, self.manifest, self.runtime.budget)
+            if settled:
+                self.resolve_local_persistence(settled)
         repaired, pending = [], []
         for role in Role:
             role = role.value
@@ -147,6 +151,10 @@ class Workflow:
                     continue
                 attempt = self.store.get(self.run_id, f'roles/{role}/attempts/{name}')
                 invocation = attempt['invocation_id']
+                if self.store.exists(self.run_id, 'recovery-decisions/' + invocation):
+                    from .recovery import validate_decision
+                    validate_decision(self.store, self.manifest, invocation)
+                    continue
                 checkpoint = 'codex-turns/' + invocation
                 if not self.store.exists(self.run_id, checkpoint):
                     continue
@@ -186,21 +194,28 @@ class Workflow:
             self.finalize(self.store.get(self.run_id, 'judgment'))
         return {'repaired_phases': repaired, 'pending': pending, 'new_model_calls': 0}
 
-    def resolve_local_persistence(self):
+    def resolve_local_persistence(self, settled_not_sent=None):
         state = self.state()
-        resolved = []
+        resolved, confirmation_hashes, recovery_hashes = [], {}, {}
         for block in state.get('operational_blockers', []):
             inv = block.get('invocation_id')
-            if block.get('kind') != 'local_persistence' or not inv:
+            if not inv:
                 continue
-            result = confirmed(self.store, self.run_id, inv)
-            if result and self.store.exists(self.run_id, f"roles/{result['role']}/phases/{result['phase']}"):
+            if block.get('kind') == 'reservation_persistence' and inv in (settled_not_sent or {}):
                 resolved.append(block)
+                recovery_hashes[inv] = settled_not_sent[inv]
+            elif settled_not_sent is None and block.get('kind') == 'local_persistence':
+                result = confirmed(self.store, self.run_id, inv)
+                if result and self.store.exists(self.run_id, f"roles/{result['role']}/phases/{result['phase']}"):
+                    resolved.append(block)
+                    confirmation_hashes[inv] = object_hash(result)
         if not resolved:
             return
         record = {'version': 'local-persistence-reconciliation-1', 'source_id': self.manifest.source_id,
                   'original_state': state, 'resolved': resolved,
-                  'confirmation_hashes': {b['invocation_id']: object_hash(confirmed(self.store, self.run_id, b['invocation_id'])) for b in resolved}}
+                  'confirmation_hashes': confirmation_hashes}
+        if recovery_hashes:
+            record['not_sent_settlement_hashes'] = recovery_hashes
         identity = object_hash(record)
         self.store.put(self.run_id, 'reconciliations/' + identity, record, immutable=True)
         remaining = [b for b in state['operational_blockers'] if b not in resolved]
@@ -530,7 +545,9 @@ class Workflow:
                 else:
                     await body
             except RuntimePaused as exc:
-                blocker = {'kind': 'local_persistence' if isinstance(exc, PersistencePending) else 'runtime_precondition',
+                kind = ('local_persistence' if isinstance(exc, PersistencePending) else
+                        'reservation_persistence' if isinstance(exc, ReservationPending) else 'runtime_precondition')
+                blocker = {'kind': kind,
                            'invocation_id': getattr(exc, 'invocation_id', None), 'message': str(exc)}
                 self.update(status="blocked", technical_result="inconclusivo", limitations=[str(exc)], operational_blockers=[blocker])
             except BudgetExceeded as exc:

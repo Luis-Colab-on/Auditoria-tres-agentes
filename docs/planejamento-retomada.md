@@ -5,7 +5,7 @@ As verificações desta reestruturação são locais e sintéticas; não constit
 nova execução real dos três agentes. Os resultados reais anteriores conservam
 seus estados e avaliações originais.
 
-Validação desta revisão: 855 testes offline e sete integrações Docker aprovados,
+Validação da reestruturação registrada em `eda1113`: 855 testes offline e sete integrações Docker aprovados,
 zero falhas, uma integração live não executada. O pacote instalado passou em 13
 verificações fora do checkout. Docker 29.9.3/Compose 5.7.0 usaram somente imagens
 locais já aprovadas; não houve pull, build ou inferência. Os recursos temporários
@@ -182,3 +182,25 @@ restritas. Uma revisão narrativa não dispensa lacunas estruturais. Veja
 `review-completion --template`, `--review` e exportação derivada. Mudança de
 evidências invalida a revisão. `completed` não aprova produção nem transforma mock
 em execução real.
+
+## Correções pontuais após a revisão de eda1113
+
+`recover --invocation ID --allow-next-attempt` encerra como `not_sent` uma reserva
+com prova válida de ausência de envio. A liquidação e seu vínculo com a decisão
+ficam em registros derivados; reserva, tentativa e checkpoint originais permanecem
+intactos. Repetir `recover` ou a reconciliação conclui gravações interrompidas, sem
+devolver chamadas ou criar slots. Tokens e custos desconhecidos continuam `null`.
+Falhas novas nessa persistência identificam a tentativa. Somente o bloqueio local
+assim vinculado é resolvido; bloqueios genéricos antigos sem vínculo suficiente e
+outras limitações permanecem explícitos.
+
+Um achado do Juiz já publicado em `blind` continua exigindo `contest/reply` quando
+reaparece em `review`. Um ID realmente novo em `review` exige registro material e
+contraditório adicional. Reutilizar ID para outro mecanismo continua inválido.
+
+A recuperação aplica o mesmo teto de bytes UTF-8 da resposta normal antes de
+confirmar ou reaproveitar a saída, sem truncar ou alterar seu conteúdo. A paginação
+mantém sua regra operacional: `max_output_bytes` inferior a 2.304 torna o plano
+inviável e bloqueia o despacho antes de consultar cliente ou executor. O schema
+continua aceitando configurações históricas menores para leitura e exportação;
+nenhum limite congelado é aumentado automaticamente.

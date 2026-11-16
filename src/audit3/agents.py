@@ -23,6 +23,12 @@ class PersistencePending(RuntimePaused):
         super().__init__('Persistência local pendente de resposta confirmada; execute recover sem nova inferência')
 
 
+class ReservationPending(RuntimePaused):
+    def __init__(self, invocation_id):
+        self.invocation_id = invocation_id
+        super().__init__('Persistência local pendente de reserva anterior ao despacho; execute recover sem repetir a tentativa')
+
+
 def retryable_api_error(error):
     """Historical offline compatibility only. There is no API retry path."""
     body = getattr(error, "body", None)
@@ -90,7 +96,10 @@ class Budget:
                            {'version': 'call-reservation-1', 'dispatch_protocol': 'durable-dispatch-1',
                             'index': len(ledger['calls']), 'entry': entry}, immutable=True)
             ledger['calls'].append(entry)
-            self._save(ledger)
+            try:
+                self._save(ledger)
+            except OSError as exc:
+                raise ReservationPending(invocation_id) from exc
             return cid
 
     async def finish(self, cid, usage=None, error=None, dispatch_status=None):

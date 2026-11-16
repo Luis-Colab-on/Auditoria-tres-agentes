@@ -84,8 +84,15 @@ class PhaseValidator:
                 else:
                     review = self.store.exists(self.run_id, 'roles/juiz/phases/review') and any(
                         f['id'] == fid for f in self.store.get(self.run_id, 'roles/juiz/phases/review')['output'].get('findings', []))
+                    blind = self.store.exists(self.run_id, 'roles/juiz/phases/blind') and any(
+                        f['id'] == fid for f in self.store.get(self.run_id, 'roles/juiz/phases/blind')['output'].get('findings', []))
+                    new_in_review = review and not blind
+                    if new_in_review:
+                        material = self.store.get(self.run_id, 'material-review') if self.store.exists(self.run_id, 'material-review') else {}
+                        if material.get('additional_round') is not True or fid not in material.get('new_finding_ids', []):
+                            raise PolicyError(f'Achado novo {fid} sem registro material da rodada adicional')
                     required = [(r, p) for r in ('auditor', 'defensor')
-                                for p in (('extra-contest', 'extra-reply') if review else ('contest', 'reply'))]
+                                for p in (('extra-contest', 'extra-reply') if new_in_review else ('contest', 'reply'))]
                 for r, p in required:
                     path = f'roles/{r}/phases/{p}'
                     if not self.store.exists(self.run_id, path) or not any(

@@ -55,6 +55,29 @@ def proven_not_sent(store, manifest, invocation, cp):
                and r['entry']['invocation_id'] == invocation and r['entry']['role'] == role for r in reservations)
 
 
+async def settle_not_sent_decisions(store, manifest, budget):
+    """Finish proven local reservations; original decisions/checkpoints stay frozen."""
+    resolved = {}
+    for invocation in store.names(manifest.run_id, 'recovery-decisions'):
+        decision = validate_decision(store, manifest, invocation)
+        if decision['status'] != 'not_sent':
+            continue
+        ledger = await budget.reconcile()
+        entries = [c for c in ledger['calls'] if c.get('invocation_id') == invocation]
+        if (len(entries) != 1 or entries[0].get('role') != decision['role']
+            or decision.get('invocation_id') != invocation or entries[0]['status'] not in {'in_flight', 'not_sent'}):
+            raise RuntimePaused('Reserva não enviada diverge da decisão de recuperação; contabilização preservada')
+        entry = entries[0]
+        proof = {'version': 'not-sent-settlement-1', 'source': 'validated_local_recovery_decision',
+                 'invocation_id': invocation, 'call_id': entry['id'],
+                 'decision_record': 'recovery-decisions/' + invocation, 'decision_hash': object_hash(decision)}
+        store.put(manifest.run_id, 'accounting/reconciliations/' + entry['id'], proof, immutable=True)
+        if entry['status'] == 'in_flight':
+            await budget.finish(entry['id'], error='ProvenNotSentRecovery', dispatch_status='not_sent')
+        resolved[invocation] = object_hash(proof)
+    return resolved
+
+
 def pending_attempts(store, manifest):
     """Unreconciled dispatches, distinct from a rejected but confirmed response."""
     result = []
@@ -144,14 +167,17 @@ async def observe_official(runtime, manifest, invocation):
         if (not isinstance(items, list) or any(not isinstance(item, dict) or item.get('type') not in allowed
             or not isinstance(item.get('id'), str) for item in items)):
             raise RuntimePaused('Turno oficial contém item incompatível; resultado não recuperado')
-        from .codex_runtime import tool_specs
+        from .codex_runtime import tool_specs, validate_response_size
         names = {tool['name'] for tool in tool_specs()}
         if any((i['type'] == 'dynamicToolCall' and i.get('tool') not in names)
                or (i['type'] == 'functionCallOutput' and i.get('name') not in names) for i in items):
             raise RuntimePaused('Ferramenta oficial fora do escopo; resultado não recuperado')
         outputs = [item['text'] for item in target.get('items', [])
                    if item.get('type') == 'agentMessage' and item.get('phase') == 'final_answer' and isinstance(item.get('text'), str)]
-        if len(outputs) != 1 or sensitive(outputs[0]):
+        if len(outputs) != 1:
+            raise RuntimePaused('Resposta final oficial ausente/ambígua ou sensível; não inferir seu conteúdo')
+        validate_response_size(outputs[0], runtime.config.limits.max_output_bytes)
+        if sensitive(outputs[0]):
             raise RuntimePaused('Resposta final oficial ausente/ambígua ou sensível; não inferir seu conteúdo')
         # A later consultation must never repair the original response's proof.
         # The controller stop is an upper bound on its original tool activity.
@@ -219,6 +245,8 @@ async def recover(workflow, invocation=None, *, check_official=False, allow_next
                             decision.update(official_record=official_name, official_hash=object_hash(proof))
                         s.put(m.run_id, 'recovery-decisions/' + invocation, decision, immutable=True)
                         validate_decision(s, m, invocation)
+                if decision:
+                    local = await workflow.reconcile()
             return {'run_id': m.run_id, **local, 'decision': decision,
                     'planning': global_plan(s, m, workflow.config), 'new_model_calls': 0}
         finally:

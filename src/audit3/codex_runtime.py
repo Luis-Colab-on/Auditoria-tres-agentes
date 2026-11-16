@@ -5,7 +5,7 @@ import inspect
 import json
 from importlib.resources import files
 from types import SimpleNamespace
-from .agents import AmbiguousTurn, Budget, BudgetExceeded, RuntimePaused, PersistencePending
+from .agents import AmbiguousTurn, Budget, BudgetExceeded, RuntimePaused, PersistencePending, ReservationPending
 from .codex_rpc import BACKEND, CLI_VERSION, StdioRPC, TurnDispatch, DispatchExpired, encode_message
 from .codex_policy import (account_identity, check_effective_config, executable, financial_check, financial_policy, financial_remaining,
                            select_effort, setup_home, verify_client)
@@ -22,6 +22,12 @@ from .codex_policy import financial_notification_check
 
 class TurnExpired(TimeoutError):
     """An already dispatched turn exhausted its unchanged monotonic deadline."""
+
+
+def validate_response_size(output, maximum):
+    size = len(output.encode('utf-8'))
+    if size > maximum:
+        raise RuntimePaused(f'Saída excede limite de bytes UTF-8: {size} > {maximum}')
 
 
 def output_schema(model):
@@ -304,7 +310,10 @@ class CodexRuntime:
             record['global_elapsed_before_turn'] = max(0, total_limit - (global_deadline - started_monotonic))
             if agent_context:
                 record['agent_context'] = agent_context
-            self.store.put(self.run_id, checkpoint, record)
+            try:
+                self.store.put(self.run_id, checkpoint, record)
+            except OSError as exc:
+                raise ReservationPending(tools.context.invocation_id) from exc
             turn_id, usage, steps, compactions = None, None, 0, None
             financial_timeout = deadline_origin == 'financial_deadline'
             deadline = asyncio.timeout_at(deadline_at)
@@ -426,8 +435,7 @@ class CodexRuntime:
                                 compactions.observe_other(msg, steps)
                             if method == 'item/completed' and item.get('type') == 'agentMessage' and item.get('phase') == 'final_answer':
                                 output = item['text']
-                                if len(output.encode()) > self.config.limits.max_output_bytes:
-                                    raise RuntimePaused('Saída excede limite')
+                                validate_response_size(output, self.config.limits.max_output_bytes)
                             if method == 'thread/tokenUsage/updated':
                                 sample = p.get('tokenUsage', {})
                                 counters = {kind: {key: value for key,value in sample.get(kind, {}).items()
@@ -498,6 +506,7 @@ class CodexRuntime:
 
     async def complete_local(self, record):
         """Finish accounting/index work without auth, quota, session or dispatch."""
+        validate_response_size(record['output'], self.config.limits.max_output_bytes)
         await self.budget.reconcile()
         entry = next((c for c in self.store.get(self.run_id, 'ledger')['calls']
                       if c['id'] == record.get('call_id') and c.get('invocation_id') == record['invocation_id']

@@ -132,7 +132,7 @@ def global_plan(store, manifest, config, *, initial_batches=None, check_tools=Fa
     import re
     from .batch_distribution import effective_batches
     from .completion import protocol_phases
-    from .security import object_hash
+    from .security import object_hash, PolicyError
     assignments = initial_batches if initial_batches is not None else effective_batches(store, manifest, config)
     extra = (store.exists(manifest.run_id, 'material-review')
              and store.get(manifest.run_id, 'material-review').get('additional_round', False))
@@ -184,6 +184,11 @@ def global_plan(store, manifest, config, *, initial_batches=None, check_tools=Fa
     effective_seconds = total_seconds(store, manifest.run_id, config)
     seconds = max(0, effective_seconds - elapsed)
     blockers = []
+    from .context_pages import page_text_budget
+    try:
+        page_text_budget(config.limits.max_output_bytes)
+    except PolicyError as exc:
+        blockers.append(str(exc))
     from .recovery import pending_attempts
     unresolved = pending_attempts(store, manifest)
     for attempt in unresolved:

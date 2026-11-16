@@ -5,7 +5,15 @@ from .security import PolicyError, canonical, digest, object_hash
 VERSION = 'context-pages-1'
 
 
+def page_text_budget(maximum):
+    budget = maximum - 2048
+    if budget < 256:
+        raise PolicyError(f'max_output_bytes={maximum}: orçamento de saída insuficiente para página verificável; mínimo operacional 2304 bytes')
+    return budget
+
+
 def create_reference(store, manifest, config, value, *, phase, audience, kind, receipt_id=None):
+    page_budget = page_text_budget(config.limits.max_output_bytes)
     text = canonical(value).decode('utf-8')
     metadata = {'version': VERSION, 'run_id': manifest.run_id, 'source_id': manifest.source_id,
                 'manifest_hash': object_hash(store.get(manifest.run_id, 'manifest')),
@@ -14,9 +22,6 @@ def create_reference(store, manifest, config, value, *, phase, audience, kind, r
                     if store.exists(manifest.run_id, 'barrier') else None,
                 'content_sha256': digest(text.encode()), 'content_utf8_bytes': len(text.encode())}
     document_id = object_hash(metadata)
-    page_budget = config.limits.max_output_bytes - 2048
-    if page_budget < 256:
-        raise PolicyError('Orçamento de saída insuficiente para página verificável')
     parts, cursor = [], 0
     while cursor < len(text):
         lo, hi = 1, min(page_budget, len(text) - cursor)
